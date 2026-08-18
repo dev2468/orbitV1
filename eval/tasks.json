@@ -1,0 +1,28 @@
+[
+  {
+    "id": "example_title",
+    "title": "eval: example.com title",
+    "goal": "Go to https://example.com and tell me the exact page title.",
+    "expect_contains": ["Example Domain"]
+  },
+  {
+    "id": "example_body_text",
+    "_comment": "example.com's body text CHANGED (it used to read 'for use in illustrative examples in documents'). The stale assertion was rewarding hallucination: a model that recited the old memorized wording passed, while a model that correctly read the live page failed. If this breaks again, check the live page before assuming the model is wrong.",
+    "title": "eval: example.com body text",
+    "goal": "Go to https://example.com and quote the first sentence of the body text exactly.",
+    "expect_contains": ["documentation examples"]
+  },
+  {
+    "id": "wikipedia_title",
+    "title": "eval: wikipedia navigation",
+    "goal": "Go to https://en.wikipedia.org/wiki/Python_(programming_language) and tell me the page title.",
+    "expect_contains": ["Python"]
+  },
+  {
+    "id": "live_data_not_memorized",
+    "_comment": "Guards against the failure above: asks for a value that cannot be answered from training data, so passing requires actually reading the page.",
+    "title": "eval: live data (not memorizable)",
+    "goal": "Go to https://news.ycombinator.com and tell me the exact point score of the number 1 top story.",
+    "expect_contains": ["point"]
+  }
+]

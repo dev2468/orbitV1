@@ -1,0 +1,123 @@
+# Section 7 risk-tier assignments, per tool name.
+#
+# This file is also the tool REGISTRY as of the "orphaned policy layer" fix:
+# before_tool_callback (orbit/policy.py) hard-blocks any tool name not
+# present in low/medium/high below or in `allowed:`. This replaced a
+# soft default (unlisted tools fell back to tier "medium" — logged, but
+# still executed), because a soft default is exactly the failure this file
+# exists to prevent: research_product.py once connected the agent straight
+# to raw Playwright MCP instead of the browser-policy proxy, and the raw
+# server's browser_navigate/browser_snapshot happened to share this file's
+# own tool names, so the tier lookup "matched" and approved tools this
+# system had never actually reviewed. A hard hold on unknown names is the
+# only version of this check that would have caught that class of bug.
+#
+# Every tool listed below was checked against Section 7's tier definitions
+# individually — none of this is bulk-assigned.
+
+low:
+  # Read-only, or side-effect-limited to a resource the tool itself
+  # owns and frees (a browser session). Matches Section 7's low examples:
+  # "Open Chrome, read a page, search, open a local app."
+  - browser_open           # opens a session for a named context; non-owner profiles are excluded inside the tool itself, not by tier
+  - browser_navigate       # navigates an open session; scheme/blocklist policy is enforced inside the tool itself
+  - browser_snapshot       # read-only accessibility snapshot of the current page
+  - browser_close          # closes a session and frees its resources; no side effects beyond that
+  - memory_search_tasks    # read-only FTS query over past tasks
+  - memory_get_context     # read-only assembly of past memory content into a context block
+  - memory_get_policy      # read-only config lookup (chrome_profiles.yaml)
+  - fs_list_dir            # read-only directory listing, scoped to filesystem_policy.yaml's allowed_roots
+  - fs_read_file           # read-only file content; wrapped as untrusted content inside the tool itself
+  - fs_search              # read-only filename/content search, scoped the same way as fs_list_dir
+  - fs_create_dir          # creates an empty directory within scoped roots; idempotent, nothing is overwritten or destroyed
+  - fs_get_metadata        # read-only stat() lookup, no content access
+  - windows_get_foreground_window  # read-only: handle/title/process of whatever holds OS focus
+  - windows_wait                   # polls for a window/process condition; no input simulated
+  - windows_scroll                 # foreground-lane but not a click/keystroke — scrolling is the tool catalog's own low-tier framing for this one
+  - email_search           # read-only keyword search against the resolved backend (today: LocalMailBackend, a local stand-in — see communication_backend.py)
+  - email_read             # read-only; wraps the body in <untrusted_email_content> markers inside the tool itself
+  - email_list_threads     # read-only, no bodies returned
+  - calendar_list_events   # read-only
+  - perception_get_state              # read-only: foreground window/process + optional task status lookup
+  - perception_get_uia_tree           # read-only: UI Automation tree dump, depth/node-capped
+  - perception_find_element           # read-only resolution (UIA tier only in this build) — does not click or type anything itself
+  - perception_capture_screenshot     # read-only: a screen/region capture, nothing is written to disk or actuated
+  - perception_wait_for_visual_change # read-only: polls for a pixel diff, no input simulated
+
+medium:
+  # Matches Section 7's medium examples: "Move/edit files, run scripts,
+  # install software" — local, reversible-in-spirit writes/code execution
+  # with no external visibility and no real-world irreversible consequence.
+  - browser_evaluate  # arbitrary JS execution inside the browser-policy server's OWN Playwright client. Not currently reachable via SafetyPlugin at all — the agent only ever sees browser_open/navigate/snapshot through the proxy (Section 6's tool_filter) — kept here as accurate risk documentation for that internal primitive, not as an active registry gate.
+  - browser_extract   # built on browser_evaluate internally, same arbitrary-JS-execution risk — "closer to running a script" than a plain read
+  - memory_write      # IS a write (flagged in review — not 'low' by default) but local-only and append-only: the memory server has no delete path at all (Prompt 3 requirement), so nothing is destroyed and there's no external visibility or real-world irreversibility. That keeps it out of 'high'.
+  - fs_write_file     # writes/creates/appends within scoped roots; refuses to silently overwrite (mode='create' fails if the file exists) so a single call can't destroy prior content by surprise
+  - fs_move           # moves within scoped roots; refuses if dest already exists rather than overwriting it
+  - fs_copy           # non-destructive to src; refuses if dest already exists rather than overwriting it
+  - windows_click     # real mouse click; self-refuses (permission_denied) below windows_control_policy.yaml's min_actuation_confidence, so a raw-coordinate call never actually lands one
+  - windows_drag      # same confidence gate as windows_click, checked on both endpoints independently
+  - windows_type      # real keystroke simulation (via clipboard paste); optionally focuses a target first under the same confidence gate as windows_click
+  - windows_key       # real keystroke simulation; self-refuses a small denylist of destructive/system combos (Alt+F4, Ctrl+Alt+Delete, Win+L) regardless of tier
+  - windows_open_app  # arbitrary code execution (launches a real process) — deliberately NOT elevated to 'high' or allowlisted; explicit design decision to follow the tool catalog's plain medium-tier assignment with no extra restriction
+  - email_draft            # creates a draft against the resolved backend; drafting alone has no external effect since email_send is blocked
+  - calendar_create_event  # generally reversible (cancelable) but can notify other people immediately — a step above pure-read per the tool catalog, even though it isn't email-send-level irreversible
+
+high:
+  # fs_delete: quarantines rather than destroys (moves to filesystem_policy.yaml's
+  # quarantine_dir), but is tiered high anyway and therefore unconditionally
+  # blocked by SafetyPlugin with confirmation_required — the same structural
+  # gate the catalog specs for email_send. Fully implemented, not a stub;
+  # simply unreachable through the agent until a real confirm channel exists.
+  - fs_delete
+  # windows_focus_window: the tool catalog itself flags stealing OS focus
+  # mid-task as a real UX problem needing a deliberate mitigation ("only
+  # run when idle / always ask first / show a countdown") — none of which
+  # exists in this codebase. Elevated to 'high' specifically so
+  # SafetyPlugin's unconditional block covers it, rather than leaving it
+  # at the catalog's plain 'medium' and hoping the model doesn't reach for
+  # it. Fully implemented, not a stub.
+  - windows_focus_window
+  # email_send: the canonical example this whole "high tier = unconditionally
+  # blocked absent a confirm channel" rule was designed around (Section 5 of
+  # the catalog). Blocked at TWO layers, not just this one — see
+  # communication_tools.py's EmailSendTool, which refuses unconditionally
+  # even if called directly, bypassing SafetyPlugin entirely. The backend
+  # send path (LocalMailBackend.send) is fully implemented and directly
+  # unit-tested; only this tool's refusal stands between it and a real send.
+  - email_send
+
+# Tools that are registered/permitted to run without needing a specific
+# low/medium/high override — they fall back to SafetyPlugin's default_tier
+# (medium) but are still part of the explicit registry, so they are not
+# hard-blocked as unregistered. Empty right now: every tool this build can
+# currently reach was assigned a real tier above. Use this list only for a
+# tool that's genuinely risk-neutral enough that assigning a tier would be
+# arbitrary — not as a shortcut to skip the thinking the rest of this file
+# does.
+allowed: []
+
+# Aspirational tool names from earlier design docs (the architecture spec's
+# Section 6 YAML example) with NO implementation anywhere in this codebase.
+# Kept as a record of intended future tiering, not as active registry
+# entries — an unimplemented name sitting in the active low/medium/high
+# lists made the config look more complete than the system actually is,
+# which is exactly the gap this file exists to prevent, not create.
+#
+# Prompts 5 (Filesystem), 1 (Windows Control), and 6 (Communication) are no
+# longer in this block — their placeholder names (files.write/files.delete,
+# windows.click, gmail.send) are implemented above under their real tool
+# names (fs_write_file, fs_delete, windows_click, email_send, ...), so
+# leaving the old placeholders here would itself be the stale-doc problem
+# this comment warns about.
+#
+# planned:
+#   high:
+#     - purchase.checkout                  # never speced as a real tool; placeholder
+#     - browser_profile.switch_non_owner   # never a real tool name — the actual
+#                                           # non-owner-profile exclusion logic lives
+#                                           # inside browser_open (OpenSessionTool in
+#                                           # browser_policy_tools.py), not a separate
+#                                           # switch tool
+#     - web.search                         # from the architecture spec's illustrative
+#                                           # Section 6 YAML example; never implemented
+#                                           # anywhere — verified by grep, not assumed

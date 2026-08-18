@@ -1,0 +1,33 @@
+# Section 7 windows-control policy — Prompt 1 of "Claude Code Prompts -
+# Building the MCP Tool Layer.md". Read at call time by
+# orbit.policy.load_windows_control_policy; not cached, same convention as
+# every other YAML in this directory except voice.yaml.
+#
+# There is no scoped-roots equivalent here the way filesystem has one —
+# mouse/keyboard input lands wherever the real OS focus is, and that can't
+# be sandboxed the way a file path can. The two knobs this file actually
+# has are a fail-closed key-combo denylist and the confidence floor below
+# which no actuation is allowed to run at all.
+
+# Matched after normalizing to lowercase, sorted, '+'-joined form, so
+# "Alt+F4" / "alt+f4" / "f4+alt" all match the same entry. Refused outright
+# with permission_denied — no confirm channel exists to route these
+# through instead, matching url_policy.yaml's fail-closed philosophy for
+# blocklisted URLs. Widen this list carefully; it exists specifically to
+# stop windows_key from being used to close an app or lock/interrupt the
+# session out from under the user.
+blocked_key_combos:
+  - alt+f4
+  - ctrl+alt+delete
+  - ctrl+alt+del
+  - win+l
+
+# Confidence.gate's own "surface" boundary (orbit/tools/foundation.py) is
+# reused here rather than inventing a second number: any resolved
+# ElementRef — UIA, OCR, vision, or the raw-{x,y} path (always scored at
+# Confidence.VISION_INFERRED) — below this is refused with
+# permission_denied by windows_click/windows_drag. There is no confirm
+# channel to route a low-confidence click through, so unlike the
+# "reverify" state Section 7 describes, anything under this line is a hard
+# stop today, not a softer retry path.
+min_actuation_confidence: 0.70

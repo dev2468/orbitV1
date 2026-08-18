@@ -1,0 +1,15 @@
+# browser-policy server (MCP tool layer Prompt 4): scheme allowlist is
+# hardcoded (http/https only) in browser_policy_tools.py. This file is the
+# blocklist of sensitive categories that require explicit human
+# confirmation before navigation — illustrative starter set, not
+# exhaustive; extend as real usage surfaces more categories.
+
+blocklist_keywords:
+  - bank
+  - paypal
+  - checkout
+  - wp-admin
+  - admin.
+  - "/admin/"
+  - login.microsoftonline
+  - accounts.google.com/signin

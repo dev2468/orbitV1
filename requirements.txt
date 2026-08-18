@@ -1,0 +1,43 @@
+google-adk
+litellm
+python-dotenv
+# mcp 2.x restructured internals (mcp.shared.session moved) in a way that
+# breaks google-adk 2.6.3's MCPToolset import. Pin per ADK's own "mcp" extra.
+mcp>=1.24,<2
+pyyaml
+pywinauto
+pywin32
+# screen-perception's perception_capture_screenshot/perception_wait_for_visual_change:
+# pure-Python, no system binary, unlike the catalog's named DXCam/
+# Windows.Graphics.Capture — see orbit/mcp_servers/perception_tools.py's
+# module docstring for the OCR/vision-tier libraries deliberately NOT added.
+mss
+PySide6
+pytest
+pytest-asyncio
+# Voice runtime (orbit/voice/): push-to-talk hotkey, capture, STT+TTS.
+#
+# moonshine-voice is GONE (was here through an earlier build) — its 245M
+# STT model's accuracy on accented English wasn't good enough. STT is now
+# Deepgram nova-3 streaming (hosted, via the `websockets` library talking
+# its documented wire protocol directly — NOT the deepgram-sdk package,
+# whose Python API has reshaped across major versions faster than the wire
+# protocol itself), with faster-whisper as the offline fallback when
+# Deepgram won't connect or drops mid-utterance. See orbit/voice/transcriber.py.
+pynput
+sounddevice
+websockets
+faster-whisper
+#
+# TTS is Kokoro-82M (Apache-2.0), NOT Piper: the actively-maintained
+# piper-tts PyPI package relicensed to GPL-3.0-or-later in Oct 2025 (repo
+# moved to OHF-Voice/piper1-gpl, its espeak-ng phonemizer no longer
+# swappable) — see orbit/voice/tts.py's module docstring before
+# "helpfully" reverting this. Kokoro itself is NOT installed here: its G2P
+# dependency (misaki[en]) has never published a version supporting Python
+# 3.13+, which this venv is. It lives in its own isolated Python 3.11
+# environment, venv_tts/, which orbit/voice/tts.py talks to as a
+# subprocess. Nothing to add to *this* file for it — to (re)create it:
+#   winget install Python.Python.3.11
+#   <path-to-3.11>\python.exe -m venv venv_tts
+#   venv_tts\Scripts\python.exe -m pip install "misaki[en]" kokoro soundfile

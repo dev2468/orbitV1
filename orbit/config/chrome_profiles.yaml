@@ -1,0 +1,22 @@
+# Section 7 policy/profile resolver — config, not prompt text.
+# Non-owner profiles (mom/dad/sister) are never auto-selected by inference:
+# resolve_profile() in policy.py enforces owner_confirmation_required and
+# raises if the caller hasn't passed an explicit confirmation for those.
+
+dev:
+  default: true
+  contexts: [personal, general, research]
+  profile_dir: data/chrome_profiles/dev
+
+dev_college:
+  contexts: [college, assignments]
+  profile_dir: data/chrome_profiles/dev_college
+
+mom:
+  owner_confirmation_required: true
+
+dad:
+  owner_confirmation_required: true
+
+sister:
+  owner_confirmation_required: true

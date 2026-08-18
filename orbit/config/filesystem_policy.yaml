@@ -1,0 +1,58 @@
+# Section 7 filesystem scoping policy — Prompt 5 of "Claude Code Prompts -
+# Building the MCP Tool Layer.md". Read at call time by
+# orbit.policy.load_filesystem_policy; not cached, so an edit here takes
+# effect on the next tool call without a restart (orbit/config/CLAUDE.md's
+# convention for every YAML in this directory except voice.yaml).
+#
+# allowed_roots is intentionally scoped to a sandbox directory under the
+# project, NOT the user's real Documents/Desktop/etc. This build runs
+# directly on the user's Windows machine with no container between the
+# agent and the real filesystem, so the safe default is a workspace the
+# agent owns rather than free run of the user's files. Widening this is a
+# deliberate operator decision — add a root, don't remove the scoping
+# mechanism itself.
+allowed_roots:
+  - data/fs_workspace
+
+# Matched as lowercased substrings against the RESOLVED absolute path,
+# mirroring url_policy.yaml's blocklist_keywords approach (a name match,
+# not a domain/segment match — deliberately blunt for a fail-closed check;
+# widen entries carefully, same caution url_policy.yaml documents).
+#
+# Wins over allowed_roots: a path inside an allowed root is still refused
+# if it matches here. Mostly defense-in-depth today since allowed_roots is
+# narrow, but this is what keeps a later-widened root from exposing
+# secrets or system directories without anyone having to remember to
+# re-derive a denylist at that point.
+denylist_keywords:
+  - .env
+  - .git
+  - venv_tts
+  - "\\venv\\"
+  - __pycache__
+  - node_modules
+  - .ssh
+  - appdata
+  - "c:\\windows"
+  - "c:\\program files"
+
+# fs_delete quarantines rather than unlinking (Section 4 of the tool
+# catalog: "delete that quarantines rather than destroys") — this is where
+# quarantined entries land, and how long they're intended to live before
+# being eligible for permanent removal.
+#
+# Nothing sweeps expired entries yet — no automatic purge is wired up.
+# That mirrors this codebase's existing accepted pattern for
+# db.purge_old_events (orbit/db.py): implemented and correct, no caller.
+# Treat quarantine_ttl_hours as documentation of intent, not an active
+# guarantee, until a sweep exists. The TTL expiry is the actual
+# irreversible step per the catalog's own note on fs_delete — gate that
+# separately if it's ever automated, don't let it fire silently.
+quarantine_dir: data/quarantine
+quarantine_ttl_hours: 168
+
+# Anything fs_read_file / fs_search reads as text content is truncated
+# past this many bytes to keep a single call from flooding the model's
+# context — same motivation as memory_tools.py's GetTaskTool truncating
+# verbose event rows.
+max_read_bytes: 200000

@@ -1,0 +1,42 @@
+# Section 7 communication policy — Prompt 6 of "Claude Code Prompts -
+# Building the MCP Tool Layer.md". Read at call time by
+# orbit.policy.load_communication_policy; not cached, same convention as
+# every other YAML in this directory except voice.yaml.
+#
+# Shape deliberately mirrors chrome_profiles.yaml: an account_context
+# string (e.g. "personal") resolves to an entry here, exactly the same way
+# a browser context resolves to a Chrome profile. Non-owner accounts
+# (mom/dad/sister) carry owner_confirmation_required and no `contexts:`
+# list, and orbit/mcp_servers/communication_tools.py's _resolve_account
+# checks by BOTH contexts membership and profile name — the same
+# double-check chrome_profiles.yaml's own comment insists on, for the same
+# reason: a family member's account must be refused either way it's asked
+# for, not just the phrasing someone happened to think to block.
+#
+# `backend` names an implementation communication_backend.py's
+# _get_backend() knows how to construct. Only "local" exists today — see
+# that module's docstring for what "local" actually is (an honestly-
+# labeled stand-in, not a real mailbox) and what a real Gmail/IMAP backend
+# would need to replace it. Requesting an unknown backend name is a hard
+# config error, not a silent fallback to "local" — same "no silent
+# fallback" rule chrome_profiles.yaml already established for profile
+# resolution.
+#
+# No top-level wrapper key, same shape as chrome_profiles.yaml: account
+# context names are the YAML root keys directly, so
+# load_communication_policy() returns this dict as-is and every resolver
+# can do `accounts.items()` without an extra `["accounts"]` unwrap.
+
+personal:
+  backend: local
+  default: true
+  contexts: [personal, work, general]
+
+mom:
+  owner_confirmation_required: true
+
+dad:
+  owner_confirmation_required: true
+
+sister:
+  owner_confirmation_required: true
