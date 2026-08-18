@@ -266,10 +266,12 @@ def search_task_history(
 
 def get_daily_cost(tool_call: str, *, day: Optional[str] = None) -> float:
     """Sum of events.cost_usd for a given tool_call within one UTC calendar
-    day (default: today). Used by the voice runtime's daily spend cap
-    (Section 14.8 cost visibility) — checked BEFORE starting a new
-    transcription, not after, so the cap actually stops spend rather than
-    just reporting it after the fact."""
+    day (default: today) — generic per-tool daily spend cap infrastructure
+    (Section 14.8 cost visibility), meant to be checked BEFORE starting a
+    costed call, not after, so a cap actually stops spend rather than just
+    reporting it after the fact. No caller currently exists: its one
+    caller was the voice runtime's daily transcription-cost cap, removed
+    along with all voice code — see orbit/CLAUDE.md."""
     day = day or datetime.now(timezone.utc).date().isoformat()
     with get_connection() as conn:
         row = conn.execute(

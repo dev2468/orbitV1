@@ -1,7 +1,7 @@
 # Section 7 windows-control policy — Prompt 1 of "Claude Code Prompts -
 # Building the MCP Tool Layer.md". Read at call time by
 # orbit.policy.load_windows_control_policy; not cached, same convention as
-# every other YAML in this directory except voice.yaml.
+# every other YAML in this directory.
 #
 # There is no scoped-roots equivalent here the way filesystem has one —
 # mouse/keyboard input lands wherever the real OS focus is, and that can't

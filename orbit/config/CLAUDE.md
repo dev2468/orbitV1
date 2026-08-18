@@ -1,8 +1,7 @@
 # orbit/config/ — what each YAML governs
 
-Eight files. Each is read at call time by a named loader; none is cached across calls, so an edit
-takes effect on the next tool call without a restart (the voice runtime is the exception — it loads
-its config once at startup).
+Six files. Each is read at call time by a named loader; none is cached across calls, so an edit
+takes effect on the next tool call without a restart.
 
 | File | Read by | Consumed by |
 | --- | --- | --- |
@@ -12,8 +11,10 @@ its config once at startup).
 | `filesystem_policy.yaml` | `policy.load_filesystem_policy` | `filesystem_tools._resolve_scoped_path`, `DeleteTool`, `ReadFileTool`, `SearchTool` |
 | `windows_control_policy.yaml` | `policy.load_windows_control_policy` | `windows_control_tools._require_confidence`, `_is_blocked_combo` |
 | `communication_policy.yaml` | `policy.load_communication_policy` | `communication_tools._resolve_account` |
-| `voice.yaml` | `voice.config.load_voice_config` | `VoiceRuntime`, `load_transcriber`, `VoiceSpeaker` |
-| `keyterms.yaml` | `voice.config.load_voice_config` | `DeepgramTranscriber._build_url` |
+
+`voice.yaml` and `keyterms.yaml` (Deepgram STT config/keyterm list) no longer exist — they governed
+the voice runtime, removed outright on the `remove-voice-integration` branch along with
+`orbit/voice/` itself.
 
 **screen-perception has no policy YAML, deliberately** — every tool it exposes is a pure read (a
 screenshot, a UIA tree, foreground-window info) with nothing to scope, allowlist, or deny. Not an
@@ -119,21 +120,3 @@ nicely" path).
 `backend:` (only on owner-permitted accounts) names an implementation
 `communication_backend.get_backend` knows how to construct — today only `"local"` exists. Requesting
 an unregistered name is a hard `ValueError`, not a fallback to `"local"`.
-
-## voice.yaml and keyterms.yaml
-
-`load_voice_config` merges: `_DEFAULTS` in `voice/config.py` ← `voice.yaml` ← `keyterms.yaml` for
-the `keyterms` key ← `DEEPGRAM_API_KEY` from the environment. Any key present in `_DEFAULTS` but
-absent from the YAML still resolves; a key in neither raises `KeyError` at use.
-
-**`DEEPGRAM_API_KEY` is not in `.env.example`** even though the voice runtime needs it and warns at
-startup when it is missing. It is a real gap — the key lives in `.env` only. Add it to the example
-when touching that file.
-
-`deepgram_cost_per_minute_usd` is a hardcoded list price, never fetched live; it feeds the `cost_usd`
-column and the daily cap, so a stale value silently mis-sizes both. `tts_disable_espeak_fallback`
-must stay `true` — the reason is a licensing one, see `orbit/voice/CLAUDE.md`.
-
-Keyterms use repeated `?keyterm=` params with no weights or intensifiers — that syntax belongs to
-the older deprecated `keywords` feature and will not work here. The list is loaded fresh on every
-voice runtime start, so it grows by adding a line, no code change.

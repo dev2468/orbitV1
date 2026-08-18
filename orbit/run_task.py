@@ -96,6 +96,64 @@ DEMO_GOAL = (
 )
 
 
+async def _run_and_print(goal: str, *, lane: str) -> dict[str, Any]:
+    """Shared by the one-shot CLI path and the REPL: runs one goal through
+    the exact same run_task() call, prints the same output shape either
+    way. Not a second execution path — just the printing wrapped once
+    instead of duplicated."""
+    title = (goal[:60] + "...") if len(goal) > 60 else goal
+    print(f"\n> {goal}\n  (working — this takes ~15-45s{', foreground lane' if lane == 'foreground' else ''})\n")
+    outcome = await run_task(title, goal, lane=lane)
+
+    print("-" * 60)
+    if outcome["status"] == "COMPLETED":
+        print(outcome["result"])
+    else:
+        print(f"FAILED: {outcome['result']}")
+    print("-" * 60)
+    print(f"task_id: {outcome['task_id']}  (visible in the GUI dashboard)\n")
+    return outcome
+
+
+async def _repl() -> None:
+    """The interactive entry point now that voice is gone: a persistent
+    loop, not a fresh process per task. Each typed line becomes exactly
+    one call to run_task() — the same call the one-shot CLI path makes,
+    the same call a voice utterance used to make — so this changes how a
+    goal gets typed in, not how it's executed. The process stays up
+    between goals: MCP server subprocesses, the NIM connection, and
+    everything else warm up once, not once per goal.
+
+    Runs every typed goal under lane="headless" (no --foreground inside
+    the REPL, matching a plain `python -m orbit.run_task <goal>` call
+    without that flag) — a foreground-lane goal still goes through the
+    one-shot CLI path with --foreground.
+    """
+    print("Orbit REPL — type a goal and press Enter.")
+    print(f'  e.g. "{DEMO_GOAL}"')
+    print("Type 'exit' or 'quit' (or Ctrl+C/Ctrl+D) to leave.\n")
+    while True:
+        try:
+            goal = input("orbit> ").strip()
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            break
+        if not goal:
+            continue
+        if goal.lower() in ("exit", "quit"):
+            break
+        try:
+            await _run_and_print(goal, lane="headless")
+        except KeyboardInterrupt:
+            # Interrupt mid-task: report and return to the prompt rather
+            # than killing the whole REPL process.
+            print("\n(interrupted)\n")
+    print("Goodbye.")
+
+
 def _main() -> int:
     # Model output routinely contains non-ASCII (em-dashes, curly quotes,
     # accented names). The Windows console's default codepage renders those
@@ -132,19 +190,20 @@ def _main() -> int:
     # so quoting is optional:
     #   python -m orbit.run_task find the cheapest 65 inch tv
     #   python -m orbit.run_task --foreground open notepad and type hello
-    goal = " ".join(args).strip() or DEMO_GOAL
-    title = (goal[:60] + "...") if len(goal) > 60 else goal
+    #
+    # No goal at all (just `python -m orbit.run_task`, or
+    # `--foreground` alone) now drops into the REPL instead of running
+    # DEMO_GOAL once and exiting — that one-shot fallback was never a
+    # real interactive entry point, and voice used to be the only actual
+    # one. --foreground with no goal still just starts the (headless)
+    # REPL; there is no foreground REPL mode (see _repl's docstring) —
+    # use --foreground with an explicit goal for a one-shot foreground task.
+    goal = " ".join(args).strip()
+    if not goal:
+        asyncio.run(_repl())
+        return 0
 
-    print(f"\n> {goal}\n  (working — this takes ~15-45s{', foreground lane' if foreground else ''})\n")
-    outcome = asyncio.run(run_task(title, goal, lane=lane))
-
-    print("-" * 60)
-    if outcome["status"] == "COMPLETED":
-        print(outcome["result"])
-    else:
-        print(f"FAILED: {outcome['result']}")
-    print("-" * 60)
-    print(f"task_id: {outcome['task_id']}  (visible in the GUI dashboard)\n")
+    outcome = asyncio.run(_run_and_print(goal, lane=lane))
     return 0 if outcome["status"] == "COMPLETED" else 1
 
 

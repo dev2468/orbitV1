@@ -1,7 +1,7 @@
 # Section 7 communication policy — Prompt 6 of "Claude Code Prompts -
 # Building the MCP Tool Layer.md". Read at call time by
 # orbit.policy.load_communication_policy; not cached, same convention as
-# every other YAML in this directory except voice.yaml.
+# every other YAML in this directory.
 #
 # Shape deliberately mirrors chrome_profiles.yaml: an account_context
 # string (e.g. "personal") resolves to an entry here, exactly the same way

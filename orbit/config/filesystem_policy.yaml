@@ -2,7 +2,7 @@
 # Building the MCP Tool Layer.md". Read at call time by
 # orbit.policy.load_filesystem_policy; not cached, so an edit here takes
 # effect on the next tool call without a restart (orbit/config/CLAUDE.md's
-# convention for every YAML in this directory except voice.yaml).
+# convention for every YAML in this directory).
 #
 # allowed_roots is intentionally scoped to a sandbox directory under the
 # project, NOT the user's real Documents/Desktop/etc. This build runs

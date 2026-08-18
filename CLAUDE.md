@@ -1,18 +1,22 @@
 # Orbit
 
-Voice-driven personal task agent: the user holds a hotkey and speaks a goal, and Orbit plans and
+Text-driven personal task agent: the user types a goal into a persistent REPL, and Orbit plans and
 executes it end to end using browser automation plus its own task history. Built on Google ADK +
 LiteLLM with the model reached through NVIDIA NIM. Every tool the model can call is served by an
 MCP server sitting behind an ADK safety plugin — the model never touches an in-process tool.
 
+**No voice integration exists in this codebase.** An earlier build had one (push-to-talk hotkey,
+Deepgram/faster-whisper STT, Kokoro TTS) — it was removed outright on the `remove-voice-integration`
+branch, not paused or parked. `git log`/`git show` on that branch is where it lives if it's ever
+needed again, not a folder in the live tree. See "Known open issues" below for the one piece of
+still-live infrastructure (`db.get_daily_cost`) that voice used to be the sole caller of.
+
 ## Stack
 
-- Python **3.13.7** (`venv/`). Load-bearing: it is why TTS is isolated and why some deps are pinned.
+- Python **3.13.7** (`venv/`). One venv — there was a second, isolated 3.11 environment
+  (`venv_tts/`) solely to run Kokoro TTS; it's gone along with the rest of the voice code.
 - `mcp>=1.24,<2` — mcp 2.x moved `mcp.shared.session`, which breaks google-adk 2.6.3's `MCPToolset`
   import. Installed: mcp 1.29.0, google-adk 2.6.3. Do not unpin.
-- **Two venvs.** `venv/` (3.13) runs everything. `venv_tts/` is a separate Python **3.11** holding
-  only kokoro+misaki+soundfile, because Kokoro's G2P dep `misaki[en]` has never supported 3.13.
-  It is spoken to as a subprocess, never imported. See `orbit/voice/CLAUDE.md` before touching it.
 - SQLite at `data/orbit.db` (WAL). Playwright MCP via `npx`. PySide6 for the dashboard. `mss` for
   screen-perception's screenshots (pure-Python, no system binary — not the catalog's named DXCam).
 
@@ -22,23 +26,25 @@ Always `venv\Scripts\python.exe` — the venv is not on PATH, so a bare `python`
 interpreter or none at all. Everything runs from the project root.
 
 ```
-venv\Scripts\python.exe -m orbit.run_task find the cheapest 65 inch tv   # run a task (quoting optional)
-venv\Scripts\python.exe -m orbit.run_task --foreground open notepad ...  # opts into lane=foreground — the ONLY way windows-control tools are reachable
+venv\Scripts\python.exe -m orbit.run_task                                # no goal -> persistent REPL: type a goal, Enter, repeat. 'exit'/Ctrl+C/Ctrl+D to leave
+venv\Scripts\python.exe -m orbit.run_task find the cheapest 65 inch tv   # one-shot: single goal on the command line, exits after
+venv\Scripts\python.exe -m orbit.run_task --foreground open notepad ...  # opts into lane=foreground — the ONLY way windows-control tools are reachable (one-shot only, not inside the REPL)
 venv\Scripts\python.exe -m orbit.run_task --list-models                  # known-good models + active one
 venv\Scripts\python.exe gui\main.py                                      # read-only task dashboard
-venv\Scripts\python.exe -m orbit.voice                                   # voice runtime; hold ctrl+space
 venv\Scripts\python.exe -m pytest tests\ -q                              # 133 tests (some hit the network; a live-UI windows-control test is opt-in, see tests/CLAUDE.md)
 venv\Scripts\python.exe -m eval.run_eval                                 # eval harness against live sites
 ```
 
+The REPL and the one-shot form both call the exact same `run_task()` — the REPL (`orbit/run_task.py`'s
+`_repl`) is a `while True` loop around it, not a second execution path. Each typed line is one call,
+one `task_id`, one row through `TaskManager`/`SafetyPlugin`/the events table, same as a CLI-argument
+goal always was. The process stays up between goals, unlike the one-shot form.
+
 ## Architecture
 
 ```
-hotkey (pynput global OS hook)  ──▶ capture (sounddevice 16k mono)
+REPL (`while True: input()`) or a one-shot CLI arg — both call run_task() directly
                                         │
-                                        ▼
-                          transcriber (Deepgram ws │ faster-whisper)
-                                        │  transcript
                                         ▼
                       run_task(title, goal) ── db.create_task ─▶ tasks row
                                         │
@@ -92,7 +98,6 @@ These hold no matter which file you are in.
 | any MCP server, browser sessions, the reaper, filesystem scoping, windows-control actuation, the communication backend, screen-perception, `uia_resolver.py`, untrusted-content wrapping | `orbit/mcp_servers/CLAUDE.md` |
 | `MCPToolset` wiring, `tool_filter`, how `task_id` reaches a server subprocess | `orbit/skills/CLAUDE.md` |
 | any `*.yaml` under `orbit/config/`, or adding/retiering a tool | `orbit/config/CLAUDE.md` |
-| anything under `orbit/voice/` — **read it before editing any threading** | `orbit/voice/CLAUDE.md` |
 | the PySide6 dashboard | `gui/CLAUDE.md` |
 | writing or fixing a test, or a DB-isolation surprise | `tests/CLAUDE.md` |
 | the eval harness or a failing eval case | `eval/CLAUDE.md` |

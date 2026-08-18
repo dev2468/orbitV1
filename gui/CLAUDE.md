@@ -9,8 +9,8 @@ not drive the agent, submit tasks, cancel them, or write to the database. It cal
 and `db.list_tasks()` on a 2s `QTimer` and repaints. That is the whole program.
 
 The refresh loop exists because tasks are normally started from a *different process* —
-`orbit.run_task`, `eval.run_eval`, or the voice runtime — so the dashboard has no in-process signal
-to react to and polls the shared SQLite file instead. The table is also
+`orbit.run_task` (one-shot or its REPL) or `eval.run_eval` — so the dashboard has no in-process
+signal to react to and polls the shared SQLite file instead. The table is also
 `setEditTriggers(NoEditTriggers)`: cells cannot be edited into the DB.
 
 **If you add a control here, do not write to `orbit.db` from this process.** Cancellation and

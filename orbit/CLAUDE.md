@@ -136,6 +136,10 @@ Note the first LiteLLM call takes ~18s (warm-up) and subsequent ones ~1s — not
 - `search_task_history` (over `memory`) is a plain `LIKE '%query%'` substring match, **not**
   tokenized — a caller searching a phrase the row does not literally contain gets nothing back.
   This bites test fixtures and anything that assumes it behaves like the FTS path.
-- `get_daily_cost` is checked *before* spending, not after — see `orbit/voice/CLAUDE.md`.
+- `get_daily_cost` sums `events.cost_usd` for a tool_call within a day, meant to be checked *before*
+  spending rather than after so a cap actually stops spend. It has **no callers anywhere in this
+  codebase** — its one caller was the voice runtime's daily transcription-cost cap, removed along
+  with all voice code. Left in `db.py` as generic infrastructure (nothing about its implementation
+  is voice-specific); the next cost-capped tool_call is what would call it next, not a rebuild.
 - Event logging is duplicated across `policy.py` and `orbit/tools/foundation.py` (Fix 7 pending);
   `tests/CLAUDE.md` has the rule that follows from it.
