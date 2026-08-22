@@ -1,0 +1,98 @@
+# screen-perception policy.
+#
+# Read at call time by policy.load_perception_policy, same convention as
+# every other loader in orbit/policy.py.
+#
+# This file exists as of the candidate-generation work (Phase 1). Before it,
+# screen-perception deliberately had no policy YAML — every tool it exposed
+# was a pure read with nothing to scope or deny, and orbit/config/CLAUDE.md
+# said so. That is still true of the READS. What this file governs is not a
+# permission boundary but the shape of candidate generation, which has real
+# tunables (how many boxes, how small is too small) that would otherwise be
+# magic numbers buried in Python.
+
+candidates:
+  # How many candidate boxes the generator returns at most. Matches
+  # vision_benchmark.yaml's `max_marks` for a reason: the set-of-mark prompt
+  # step numbers exactly these, and a mark count the benchmark never
+  # measured is an untested configuration.
+  max_candidates: 12
+
+  # Smaller than this on either side and a box is a sliver — a 1px separator,
+  # a collapsed container, a zero-height label. Marking it wastes an index
+  # and clutters the overlay.
+  min_box_px: 8
+
+  # Discard any box covering more than this fraction of the window. UIA trees
+  # are full of full-window wrappers (the window itself is depth 0, and
+  # client-area panes are usually near-identical to it). Those are true
+  # rectangles but useless as candidates: "which box is the Save button"
+  # cannot be answered with a box containing everything.
+  max_area_ratio: 0.9
+
+  # Below this many usable boxes, the UIA tree is treated as unhelpful and
+  # the fallback is consulted. Three is the point where numbering stops being
+  # meaningful — with one or two boxes the model is not choosing, it is
+  # confirming.
+  min_useful_candidates: 3
+
+  # Fraction of usable boxes that must carry a non-empty UIA name for the
+  # tree to count as informative. This is the Microsoft Solitaire test: that
+  # app exposes its entire UI as a stack of NAMELESS Panes, so a tree can be
+  # structurally rich and still tell you nothing about what anything IS.
+  # A tree that passes min_useful_candidates but fails this is exactly the
+  # case the vision tier exists for.
+  require_named_fraction: 0.2
+
+uia_tree:
+  # Deeper and wider than perception_get_uia_tree's own defaults (6/200).
+  # That tool is capped to protect the MODEL's context window; this walk
+  # feeds a local geometry filter, not the model, so the cap that matters is
+  # wall-clock rather than tokens. Leaf controls are also what we want here,
+  # and they live at the bottom of the tree.
+  max_depth: 8
+  max_nodes: 400
+
+omniparser:
+  # disabled | http
+  #
+  # DEFAULT disabled, and that is a decision, not a TODO. See the
+  # screen-perception section of orbit/mcp_servers/CLAUDE.md for the full
+  # reasoning; the short version is that OmniParser's published
+  # requirements.txt pulls in easyocr AND paddleocr — the exact two stacks
+  # this project already refused by name when it declined to build an OCR
+  # tier — on top of torch, torchvision, ultralytics and transformers.
+  #
+  # "http" points at an OmniParser deployment someone else is hosting (a
+  # local container, a workstation on the LAN, a managed endpoint). That
+  # keeps the multi-GB stack and its GPU out of this venv while still making
+  # the tier reachable. There is deliberately no "local" mode: adding one
+  # would mean vendoring the dependency this config exists to avoid.
+  mode: disabled
+  endpoint: null
+  timeout_s: 60
+
+  # Detections below this score are dropped before numbering.
+  min_confidence: 0.3
+
+vision:
+  # How many times the grounding step is called on the SAME marked image.
+  # The answers are compared: unanimous agreement is a strong signal, a split
+  # is a weak one. Three is the smallest number that can produce a MAJORITY
+  # rather than just "same or different" — with two samples a disagreement
+  # tells you nothing about which one to believe.
+  #
+  # COST: this multiplies every vision_locate by grounding_samples. On the
+  # provider's bad days that is the difference between one 9-minute call and
+  # three. Set to 1 to disable sampling entirely (agreement is then reported
+  # as "single_sample" rather than faked).
+  grounding_samples: 3
+
+  # Below this many candidate boxes, set-of-mark is skipped and the original
+  # freeform-point prompt is used instead. Numbering two boxes does not ask
+  # the model to choose, it asks it to confirm — and the no-UIA windows this
+  # tier exists for are exactly the ones that produce too few candidates.
+  min_candidates_for_som: 3
+
+  # Integer pixel scale for the mark index glyphs.
+  mark_scale: 2

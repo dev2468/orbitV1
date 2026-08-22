@@ -1,6 +1,6 @@
 # orbit/config/ — what each YAML governs
 
-Six files. Each is read at call time by a named loader; none is cached across calls, so an edit
+Eight files. Each is read at call time by a named loader; none is cached across calls, so an edit
 takes effect on the next tool call without a restart.
 
 | File | Read by | Consumed by |
@@ -11,15 +11,32 @@ takes effect on the next tool call without a restart.
 | `filesystem_policy.yaml` | `policy.load_filesystem_policy` | `filesystem_tools._resolve_scoped_path`, `DeleteTool`, `ReadFileTool`, `SearchTool` |
 | `windows_control_policy.yaml` | `policy.load_windows_control_policy` | `windows_control_tools._require_confidence`, `_is_blocked_combo` |
 | `communication_policy.yaml` | `policy.load_communication_policy` | `communication_tools._resolve_account` |
+| `perception_policy.yaml` | `policy.load_perception_policy` | `candidate_source.py` (UIA/OmniParser candidate generation) |
+| `vision_benchmark.yaml` | `benchmarks.config.load_benchmark_config` | `benchmarks/grounding_bench.py` |
+
+**`vision_benchmark.yaml` is the one file here that governs no runtime behaviour.** It configures
+the offline grounding benchmark (`benchmarks/CLAUDE.md`) — arms, mark count, timeout, scene subset —
+and is deliberately *not* read by `perception_tools.py`. A benchmark config that could silently
+redirect the live vision tier's model would be a behaviour change wearing a benchmark's clothes. Its
+loader lives with its consumer rather than in `policy.py`, following `browser_policy_tools._load_blocklist`:
+`policy.py` holds loaders for files the safety layer reads, and this is not one of them.
 
 `voice.yaml` and `keyterms.yaml` (Deepgram STT config/keyterm list) no longer exist — they governed
 the voice runtime, removed outright on the `remove-voice-integration` branch along with
 `orbit/voice/` itself.
 
-**screen-perception has no policy YAML, deliberately** — every tool it exposes is a pure read (a
-screenshot, a UIA tree, foreground-window info) with nothing to scope, allowlist, or deny. Not an
-oversight; there's genuinely nothing here for a policy file to govern, unlike windows-control's
-confidence floor/key-combo denylist or filesystem's scoped roots.
+**`perception_policy.yaml` is not a permission boundary.** screen-perception's tools are still all
+pure reads (a screenshot, a UIA tree, foreground-window info) with nothing to scope, allowlist, or
+deny — unlike windows-control's confidence floor/key-combo denylist or filesystem's scoped roots.
+This file arrived with candidate generation and governs its *shape*: geometry filters (how small is
+a sliver, how large is a full-window wrapper), the two-part "is this UIA tree actually informative"
+test, and the OmniParser fallback's hosting mode. Those are real tunables that would otherwise be
+magic numbers buried in Python — which Invariant 6 forbids — not a security surface.
+
+`omniparser.mode` defaults to `disabled`, and that default is load-bearing: enabling it reaches a
+multi-gigabyte PyTorch stack whose v2 detector weights are AGPL-3.0. The full reasoning is in
+`orbit/mcp_servers/CLAUDE.md`'s candidate-generation section; `candidates.max_candidates` is pinned
+by test to equal `vision_benchmark.yaml`'s `max_marks`.
 
 ## risk_tiers.yaml has two jobs
 

@@ -101,6 +101,7 @@ These hold no matter which file you are in.
 | the PySide6 dashboard | `gui/CLAUDE.md` |
 | writing or fixing a test, or a DB-isolation surprise | `tests/CLAUDE.md` |
 | the eval harness or a failing eval case | `eval/CLAUDE.md` |
+| vision grounding accuracy, prompt-shape or model comparisons | `benchmarks/CLAUDE.md` |
 
 Design intent and the section numbers the code cites live in
 `AI Assistant - System Architecture & Design Spec.md` (Sections 1–14) and
@@ -129,7 +130,20 @@ screen, not clicking it.
 
 The model's own self-reported confidence, when it volunteers one, is recorded under
 `element.state["vision"]["model_confidence"]` for debugging and is never promoted into the
-`confidence` field the gate reads.
+`confidence` field the gate reads. **The same rule now covers repeated-sampling agreement.** The
+grounding step runs 3x on one image and records `unanimous`/`majority`/`split` under
+`element.state["vision"]["agreement"]` — a diagnostic signal only. Consistency is not correctness; a
+model can be confidently and repeatably wrong. A set-of-mark answer is *more* tempting to trust than
+a guessed point because it carries a real UIA rectangle, which is precisely why there is a second
+test (`test_a_set_of_mark_result_is_still_refused_by_actuation`) locking the same door.
+
+**The spike's own dataset does not exist.** The VISION TIER block reports 76% over 46 targets on 10
+screenshots and states outright that those inputs were never checked in — they captured a real
+desktop as it happened to be. Verified absent: no images anywhere outside `venv/`, nothing in
+`automation_spikes/`, nothing in any commit. So that 76% is a historical note and **not** a baseline
+anything can be compared against. `benchmarks/` exists to replace it with a re-runnable one on
+committed synthetic fixtures — see `benchmarks/CLAUDE.md`, including why absolute numbers from it are
+not field accuracy.
 
 `perception_find_element` gained a `"vision"` tier, **opt-in only**: it fires when the caller passes
 `tier_order=["uia","vision"]` and a `query.description`, never automatically on a UIA miss. Reasons

@@ -287,29 +287,175 @@ first. `windows_control_tools.py` was refactored to import from there; its own t
 (`test_windows_control_tools.py`, `test_windows_control_live.py`) was re-run after the extraction to
 confirm the refactor didn't change behavior, not just that it compiled.
 
-**Two of the catalog's seven tools are deliberately absent, not stubbed:**
+**One of the catalog's seven tools is deliberately absent, not stubbed:**
 
 - `perception_read_text_region` (OCR) — the catalog names PaddleOCR; no OCR engine is installed in
   this environment (Tesseract needs a separate system-level binary install outside pip; PaddleOCR/
   EasyOCR pull in a multi-hundred-MB ML stack). Installing one unattended is a materially bigger,
   more consequential call than the `mss` screenshot library actually added (small, pure-Python, no
-  system dependency) — the kind of thing to confirm rather than assume, so it wasn't done.
-- `perception_vision_locate` — the catalog is explicit that this one's signature should NOT be
-  guessed: "the representation decision belongs in the [grounding] spike's output, not guessed here."
-  No such spike has run in this build, and whether vision calls would even go through Nemotron or a
-  dedicated UI-TARS deployment is unconfirmed (root `CLAUDE.md`'s known issues). Guessing now risks
-  exactly the throwaway-and-redo work the catalog is warning against.
+  system dependency) — the kind of thing to confirm rather than assume, so it wasn't done. It is not
+  faked with placeholder output — it is simply not in this server's tool set, the same "honest scope
+  note" pattern `browser_policy_tools.py` used for `browser_click`/`browser_type`.
 
-Neither is faked with placeholder output — both are simply not in this server's tool set, the same
-"honest scope note" pattern `browser_policy_tools.py` used for `browser_click`/`browser_type` and
-`windows_control_tools.py` used for horizontal scroll and Win-key combos.
+**`perception_vision_locate` IS built now.** The catalog required a grounding spike before its
+signature could be fixed ("the representation decision belongs in the spike's output, not guessed
+here"); that spike has been run against 10 real screenshots and 46 targets on this machine, and both
+its outcome and the decision it produced live in the VISION TIER comment block at the top of the
+vision code in `perception_tools.py` — next to the code, not in a separate document that would rot.
 
-**`perception_find_element` only resolves the `uia` tier.** `tier_order` is still accepted (forward
-compatibility with the eventual 3-tier version) but any non-`"uia"` entry is reported back in
-`tiers_unavailable` rather than silently ignored — the caller can tell the difference between "no
-match" and "that tier doesn't exist yet." An element with no UI Automation representation at all
-(some custom-drawn UI) simply cannot be resolved by this tool in this build; there is no OCR/vision
-fallback to catch it.
+The short version of what the spike decided: the model is `nvidia_nim/google/gemma-4-31b-it`, called
+by the tool itself via its own LiteLLM call (not through the orchestrating agent's model, which is
+not multimodal). Asked with no output format imposed, it answers in Gemma's native pointing format —
+`{"point": [y, x]}` normalised 0-1000, y first — every time, sometimes wrapped in prose or a fence,
+so the point object is matched wherever it appears. Preprocessing is: resolve window → capture
+through the shared `_grab_png` path → crop to the window's bounds → downscale **only** if the base64
+exceeds NVIDIA's documented ~180,000-char inline ceiling → base64 PNG. Coordinate translation
+reverses the resize then the crop, in that order, and is round-tripped against a synthetic
+crop/resize in the tests because an off-by-the-crop-origin bug produces plausible-looking answers
+that are wrong by a small constant.
+
+Two traps worth knowing before touching this code:
+
+- **DPI ordering.** `import mss` does *not* make the process DPI-aware; instantiating `mss.MSS()`
+  does. Before that, `GetWindowRect` returns logical coordinates while an `mss` grab is physical, so
+  reading window bounds first crops the wrong rectangle by the display's scale factor.
+  `_ensure_physical_screen_coords()` forces the ordering.
+- **The server subprocess has no API key.** `orbit/skills/*.py` spawn these servers with
+  `env={"ORBIT_TASK_ID": ...}`, and mcp's `StdioServerParameters` uses that dict *instead of*
+  inheriting the parent environment — so unlike `orbit/agent.py`, this process starts with no
+  `NVIDIA_NIM_API_KEY`. `_nim_api_key()` loads the project `.env` itself, by a path resolved from
+  the module file rather than the cwd.
+
+**The vision tier is read-only and structurally cannot actuate.** Its `ElementRef` carries
+`Confidence.VISION_INFERRED` (0.50), below `windows_control_policy.yaml`'s `min_actuation_confidence`
+(0.70), so `windows_click`/`windows_drag` refuse it exactly as they refuse a raw `{x, y}`. That is
+the invariant the whole feature had to avoid breaking, and it is pinned by
+`test_vision_sourced_element_ref_is_still_refused_by_actuation` against the real policy file and the
+real `_resolve_click_target` — not a stand-in.
+
+**`perception_find_element` now resolves two tiers, and vision is opt-in.** It fires only when the
+caller passes `tier_order=["uia","vision"]` *and* a `query.description`; it never falls back to
+vision automatically on a UIA miss. The reasoning is on `FindElementTool` — a silent fallback would
+turn a millisecond-scale local lookup into a hosted model call the caller never asked for, the two
+tiers don't take the same input (locator vs free-text description), and substituting an
+un-actuatable guess for a real control handle invisibly is exactly the false-completeness this
+codebase keeps guarding against. `"ocr"` is still reported in `tiers_unavailable`, because it still
+genuinely doesn't exist.
+
+## Candidate generation, and the OmniParser decision
+
+`candidate_source.py` produces the `{index, bounds}` boxes the set-of-mark prompt step numbers and
+overlays. It runs inside `perception_find_element`'s vision tier *before* the model call. It is pure
+observation — Section 11's read-only framing is unchanged; nothing here can move a mouse.
+
+It never raises into the vision path. A vision call that would have worked must not start failing
+because a candidate source did, so a generator failure degrades to "no candidates, here's why" and
+the call proceeds.
+
+**"Unhelpful tree" is a stronger test than "empty tree", and that distinction is the whole design.**
+The case this exists for is Microsoft Solitaire, which `VisionLocateTool`'s docstring already names:
+its entire UI surfaces through UIA as a stack of *nameless* Panes. That tree is not empty — it is
+structurally rich and semantically worthless. So `assess_uia_tree` tests two things: enough usable
+boxes (`min_useful_candidates`) **and** enough of them carrying a name (`require_named_fraction`). A
+tree that passes the first and fails the second is exactly the custom-drawn case, and a count-only
+check would sail straight past it into a useless candidate set.
+
+Filtering drops full-window wrappers (a box containing everything cannot answer "which box is the
+Save button"), slivers, invisible nodes, and duplicate rectangles. The dedupe matters more than it
+looks: UIA routinely reports a control and its wrappers at an identical rect, and numbering all of
+them makes several indices correct for one question — unscoreable. Bounds are clipped to the window
+frame for the same reason `_window_bounds_to_region` clamps on the capture side: the overlay is drawn
+on a capture of the window, so an unclipped box marks pixels the model was never shown.
+
+**OmniParser is the fallback, and it is `mode: disabled` by default. That is a decision, not a
+TODO** — and it is the same call the OCR tier got, for stronger reasons:
+
+1. **It smuggles in exactly what OCR was refused for.** OmniParser's published `requirements.txt`
+   lists **both `easyocr` and `paddleocr`** — the two stacks this project already declined by name
+   above — on top of `torch`, `torchvision`, `ultralytics` and `transformers`. Installing it as
+   published lands the refused dependency through a side door.
+2. **Size.** The bar this project set for an acceptable dependency was `mss`: pure Python, no system
+   binary. A full PyTorch stack plus YOLO and Florence-2 weights is multiple gigabytes and wants
+   CUDA — on a machine where none of `torch`/`ultralytics`/`transformers`/`cv2` is installed today.
+3. **Licensing is version-dependent and easy to get wrong.** OmniParser v2's icon detector is an
+   Ultralytics YOLOv8 derivative under **AGPL-3.0** (viral copyleft); the v3 detector is YOLOv9-based
+   under MIT, and the caption weights are MIT. Vendoring "OmniParser" without pinning *which* weights
+   is a real licensing hazard, not a footnote.
+
+So the only enabled path is `mode: http`: point it at an OmniParser someone else is hosting (a
+container, a workstation on the LAN, a managed endpoint) and the gigabytes, the GPU and the AGPL
+question all stay outside this venv. **There is deliberately no `local` mode** — adding one means
+vendoring the dependency this design exists to avoid. When disabled, `omniparser_candidates` *raises*
+rather than returning an empty list, because "the tier is absent" and "the tier looked and found
+nothing" are different facts and this codebase keeps them distinguishable (same reason `"ocr"` is
+still reported in `tiers_unavailable`).
+
+The response parser accepts boxes as absolute pixels **or** 0-1 normalised, because OmniParser's
+output has shipped both ways depending on version and wrapper. Normalised is detected by every
+coordinate being ≤ 1.0 — a genuine pixel box on any window this tool can capture is wider than one
+pixel, so the test cannot misfire.
+
+Geometry knobs live in `orbit/config/perception_policy.yaml`, read at call time by
+`policy.load_perception_policy`. `max_candidates` is deliberately equal to the benchmark's
+`max_marks`, pinned by a test: the prompt numbers exactly these boxes, and a mark count the benchmark
+never measured is an untested configuration.
+
+## Set-of-mark grounding, and the fallback that must survive it
+
+`perception_vision_locate` now has **two** prompt shapes. Which one runs is decided by how many
+candidate boxes exist, not by a flag:
+
+- **Set-of-mark** (`>= min_candidates_for_som`, default 3): the candidates are drawn onto the capture
+  as numbered boxes (`mark_overlay.draw_marks`) and the model is asked *which number*, not *where*.
+  That turns coordinate regression into classification over a short list.
+- **Freeform point** (fewer candidates, or every mark answer unparseable): the original prompt, the
+  original `{"point": [y, x]}` parse, the original crop→resize→normalise→invert chain. Untouched.
+
+**The point path is not legacy and must not be removed.** A `<canvas>` app or a game exposes nothing
+through UIA, produces no candidates, and is *exactly* the window this tier exists for. Set-of-mark is
+useless there by construction. `test_too_few_candidates_falls_back_to_the_point_prompt` pins it.
+
+The same applies when marks are drawn but every sample comes back unparseable: the call falls through
+to the point prompt rather than failing, because the marked image not working tells you nothing about
+whether the plain one will.
+
+**Coordinates: marks are drawn in IMAGE space, candidates live in SCREEN space.** `draw_marks`
+subtracts the crop origin. Lose that subtraction and every box is drawn a constant distance from the
+control it labels — the model then answers *correctly* about a *mislabelled* picture, which reads as a
+grounding failure and is not. Pinned by
+`test_marks_are_drawn_at_image_coordinates_not_screen_coordinates`, which checks both that the mark
+landed at the translated position *and* that nothing was drawn at the untranslated one.
+
+A set-of-mark answer resolves to the chosen candidate's bounds directly — no inverse transform,
+because those bounds were never normalised in the first place. Round-tripping them through the
+point maths could only lose precision.
+
+**Repeated sampling is a diagnostic, not a confidence input.** The grounding step runs
+`grounding_samples` times (default 3) on the identical marked image and the answers are compared:
+`unanimous` / `majority` / `split` / `no_answer`, plus `single_sample` when sampling is off — one
+sample agreeing with itself is not evidence, and calling it unanimous would overstate the only signal
+this produces. Three is the smallest count that can yield a *majority* rather than just "same or
+different".
+
+The result lands in `element.state["vision"]["agreement"]`, deliberately beside `model_confidence`,
+because both are things the model said about itself and **neither goes anywhere near the `confidence`
+field the actuation gate reads**. Consistency is not correctness: a model can be confidently and
+repeatably wrong, and this tier has no ground truth to check itself against. A set-of-mark result is
+*more* tempting to trust than a guessed point — it carries a real UIA rectangle — and that is exactly
+why `test_a_set_of_mark_result_is_still_refused_by_actuation` exists as a second lock on the door
+`test_vision_sourced_element_ref_is_still_refused_by_actuation` already guards.
+
+**Cost:** sampling multiplies every `vision_locate` by `grounding_samples`. On a bad provider day
+that is three ~9-minute calls instead of one, which is why `VisionLocateTool.default_timeout_s` is
+900s and `FindElementTool`'s outer ceiling is 930s. Set `grounding_samples: 1` to turn it off.
+
+**Known limitation:** a numbered tag can obscure the element it marks when that element is small (a
+slider handle roughly the size of the tag). Inherent to set-of-mark rather than a bug in this
+implementation, but it is a real reason a small-control miss might not be the model's fault.
+
+`benchmarks/` imports the prompt, the index parser and the renderer from here rather than copying
+them — a benchmark that marks its images with a different renderer, or scores with a different
+parser, measures something the tool does not do.
 
 **`perception_get_uia_tree` is depth- and node-capped** (`uia_resolver.get_uia_tree`, defaults
 `max_depth=6`, `max_nodes=200`) for the same reason `fs_read_file`/`memory_get_context` cap their
@@ -327,4 +473,8 @@ successive grabs with no fuzz threshold — any byte difference counts as a chan
 
 Every tool here is `risk_tier: low` and `lane: headless`, and — like `communication` — needs no lane
 gating in `orbit/agent.py`: nothing simulates input, so it's wired in unconditionally, matching
-Section 11's "perception free and always-on, actuation gated" framing exactly.
+Section 11's "perception free and always-on, actuation gated" framing exactly. That includes
+`perception_vision_locate`: it only looks, and what it returns is refused by the actuation gate, so
+it needs no more protection than a screenshot does. Its one difference from its siblings is
+`default_timeout_s = 300.0` (and 330.0 on `perception_find_element`, which may dispatch to it) —
+the 30s `BaseTool` default would kill even a successful hosted-model call.

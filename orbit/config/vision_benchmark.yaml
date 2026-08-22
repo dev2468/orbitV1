@@ -1,0 +1,76 @@
+# Grounding benchmark configuration.
+#
+# Read at call time by benchmarks/config.py:load_benchmark_config — no
+# caching, same as every other YAML here, so editing an arm takes effect on
+# the next run without touching code.
+#
+# This file governs the BENCHMARK only. It is deliberately not read by
+# perception_tools.py: Phase 0 measures the vision tier, it does not change
+# it, and a config file that silently redirected the live tool's model would
+# be a behaviour change wearing a benchmark's clothes.
+
+# Each arm is one prompt shape (optionally on one model) measured against the
+# whole fixture set. Adding a model comparison means adding arms here, not
+# editing the runner.
+#
+#   prompt_shape: "point"       -> the tier's current freeform ask; the model
+#                                  emits a normalised {"point": [y, x]}.
+#   prompt_shape: "set_of_mark" -> numbered boxes overlaid; the model returns
+#                                  a box index.
+#   model: null                 -> use whatever perception_tools._VISION_MODEL
+#                                  is currently set to. Naming the model here
+#                                  instead would duplicate that constant and
+#                                  let the two drift.
+arms:
+  - id: freeform_point
+    prompt_shape: point
+    model: null
+  - id: set_of_mark
+    prompt_shape: set_of_mark
+    model: null
+
+candidates:
+  # How many numbered boxes the set_of_mark arm draws, the answer included.
+  # 12 is a judgement call, not a measurement: enough distractors that
+  # guessing scores ~8%, few enough that the marks stay legible on an
+  # 880x560 fixture. The dense grid scene has 116 drawable elements, so some
+  # cap is mandatory — see benchmarks/overlay.py for how the subset is
+  # chosen.
+  max_marks: 12
+
+run:
+  # Per-call ceiling. The spike measured a median of 54.6s and a p90 of
+  # 640.4s on this shared hosted tier, so a short timeout scores queueing as
+  # failure. Measured again 2026-08-22: a single serial call took 540s, i.e.
+  # this tier is currently running at roughly the spike's p90 for EVERY call.
+  # 900s is sized for that, not for the spike's median.
+  request_timeout_s: 900
+
+  # Transient provider failures are retried before being scored.
+  #
+  # This is not leniency toward the model — a reply that arrives and is wrong
+  # still counts as a miss. It is about not attributing NVIDIA's connection
+  # errors to grounding accuracy. The 2026-08-22 run made the case: at
+  # concurrency 4, 23 of 24 calls died with `Nvidia_nimException - Connection
+  # error` or a timeout, which would have been reported as a 4% hit-rate if
+  # errors were scored without retrying. An error that survives every retry
+  # is still counted as a miss (the spike's convention), just not a first
+  # blip.
+  max_retries: 3
+  retry_backoff_s: 20
+
+  # Empty = every scene in benchmarks/fixtures.py. Name scene ids here to
+  # run a subset while iterating (each call is slow and costs money).
+  scenes: []
+
+  # Parallel calls. Default 1 — DO NOT RAISE without re-measuring.
+  # At concurrency 4 this endpoint failed 23 of 24 calls outright while the
+  # same requests succeed serially, so parallelism here does not buy
+  # throughput, it buys a page of connection errors. It also makes latency
+  # figures incomparable across runs, since the spread is queueing rather
+  # than compute.
+  concurrency: 1
+
+  # Where results land. One JSON per run, timestamped, so phases can be
+  # diffed against each other rather than overwriting one another.
+  results_dir: benchmarks/results

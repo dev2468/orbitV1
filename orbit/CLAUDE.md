@@ -143,3 +143,44 @@ Note the first LiteLLM call takes ~18s (warm-up) and subsequent ones ~1s — not
   is voice-specific); the next cost-capped tool_call is what would call it next, not a rebuild.
 - Event logging is duplicated across `policy.py` and `orbit/tools/foundation.py` (Fix 7 pending);
   `tests/CLAUDE.md` has the rule that follows from it.
+
+## `pending_confirmations` — the approval channel
+
+Added for the vision-tier confirmation flow. It exists because the vision tier can **see** a control
+it is not allowed to **click**: a `Confidence.VISION_INFERRED` (0.50) ElementRef sits below
+`min_actuation_confidence` (0.70), so actuation refuses it. That refusal is correct and this table
+does not relax it. What was missing was a *channel* — no way for a human to look at a guess and say
+yes — so the only available answer was "no", forever.
+
+**`approval_token` is a capability, not a record**, and every constraint on it is load-bearing:
+
+- minted **only** on approval, never on rejection — a refusal leaves nothing to leak or replay;
+- **short-lived** (`token_expires_at`): an approval is consent about a screenshot of a *moment*, and
+  replaying it later aims a click at a screen that has since changed;
+- **single-use** (`token_consumed_at`), kept as its own column rather than folded into `status`
+  because "what the human decided" and "was the capability spent" are different facts;
+- **bound to one row**, therefore to one proposed action, so one yes can never authorise a second
+  click.
+
+`resolve_pending_confirmation` updates **conditionally on the row still being PENDING** and checks
+`rowcount`. That is what stops a REJECTED confirmation from later being flipped to APPROVED — a plain
+UPDATE would do exactly that and mint a token for an action a human refused. It raises `KeyError`
+rather than returning None on a missing or already-decided row: both must stay distinguishable from
+"approved, here is your token".
+
+`consume_approval_token` returns `None` for *every* failure — unknown, spent, expired, never
+approved. The caller is deliberately not told which, because the answer to "may I act" is identical
+in all four cases and distinguishing them turns the function into an oracle for probing which tokens
+exist. Expiry is enforced inside it, never trusted from a caller-supplied clock.
+
+`_ensure_confirmation_task` materializes the `adhoc-confirmation` task **only when no task_id was
+given at all**. An explicitly-supplied unknown id is passed straight through so the foreign key
+fails loudly — inventing a row for a caller that passed the wrong id would file the approval under a
+task nobody is watching.
+
+`screenshot_path` stores a **path, not the image**. Base64 PNGs of every confirmation would grow this
+DB without bound, and the GUI can read a file.
+
+**Nothing writes to this table yet** — Phase 4 (REPL confirm) and Phase 5 (GUI approve/reject) are
+what call it. `CREATE TABLE IF NOT EXISTS` in `_SCHEMA` is the entire migration story, which works
+because `init_db()` runs at every entry point (`run_task`, every MCP server, the GUI, conftest).

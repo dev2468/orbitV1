@@ -95,6 +95,19 @@ def load_windows_control_policy(path: Optional[Path] = None) -> dict:
     return yaml.safe_load(path.read_text()) or {}
 
 
+def load_perception_policy(path: Optional[Path] = None) -> dict:
+    """screen-perception policy (orbit/config/perception_policy.yaml):
+    candidate-generation geometry filters and the OmniParser fallback's
+    hosting mode. Read at call time, same convention as every other loader
+    here.
+
+    Note this is NOT a permission boundary — screen-perception's tools are
+    all pure reads and there is nothing here to scope or deny. It governs
+    the shape of candidate generation only; see the file's own header."""
+    path = path or _CONFIG_DIR / "perception_policy.yaml"
+    return yaml.safe_load(path.read_text()) or {}
+
+
 def load_communication_policy(path: Optional[Path] = None) -> dict:
     """Section 7 communication policy (orbit/config/communication_policy.yaml):
     account_context -> account config, mirroring load_chrome_profiles'

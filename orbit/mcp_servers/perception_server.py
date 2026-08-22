@@ -7,9 +7,11 @@ Response shape follows the other servers' precedent: bare ToolResult.data
 on success, a compact {error, message} on failure — not the full envelope.
 
 Every tool here is read-only (Section 11: "perception is read-only and
-free to call while actuation is gated"). See perception_tools.py's module
-docstring for the two tools NOT built here (perception_read_text_region,
-perception_vision_locate) and why.
+free to call while actuation is gated") — including perception_vision_locate,
+which only looks at the screen and reports coordinates; it cannot click
+anything, and its output is refused by windows-control's confidence gate by
+design. See perception_tools.py's module docstring for the one catalog tool
+still NOT built here (perception_read_text_region) and why.
 
 Run standalone: python -m orbit.mcp_servers.perception_server
 """
@@ -27,6 +29,7 @@ from orbit.mcp_servers.perception_tools import (
     find_element_tool,
     get_state_tool,
     get_uia_tree_tool,
+    vision_locate_tool,
     wait_for_visual_change_tool,
 )
 
@@ -67,11 +70,31 @@ async def perception_get_uia_tree(
 
 @mcp.tool()
 async def perception_find_element(query: dict, tier_order: Optional[list] = None, task_id: str = "") -> Any:
-    """Resolve a UI element by locator to an ElementRef. query:
-    {window_handle?, automation_id?, name?, control_type?}. Feed the
-    result straight into windows_click/windows_drag's target."""
+    """Resolve a UI element to an ElementRef. query: {window_handle?,
+    automation_id?, name?, control_type?, description?}. Default tier_order
+    is ['uia'] (free, needs a locator). Pass ['uia','vision'] with
+    query.description to fall back to the vision tier on a UIA miss."""
+    resolved = _resolve_task_id(task_id)
+    # task_id rides along in args so the tool can attribute the nested
+    # vision-tier execute() to the same task rather than the adhoc row.
     result = await find_element_tool.execute(
-        {"query": query, "tier_order": tier_order}, task_id=_resolve_task_id(task_id)
+        {"query": query, "tier_order": tier_order, "task_id": resolved}, task_id=resolved
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def perception_vision_locate(
+    target_description: str, window_handle: Optional[int] = None, task_id: str = ""
+) -> Any:
+    """Locate a UI element from a plain-language description by sending a
+    screenshot of the window to a vision model. The only tier that works on
+    controls with no UI Automation representation. Slow and costs a model
+    call. The returned ElementRef is read-only intelligence: windows_click
+    and windows_drag will refuse it."""
+    result = await vision_locate_tool.execute(
+        {"target_description": target_description, "window_handle": window_handle},
+        task_id=_resolve_task_id(task_id),
     )
     return _payload(result)
 

@@ -16,3 +16,6 @@ data/fs_workspace/*
 !data/fs_workspace/.gitkeep
 data/quarantine/
 .playwright-mcp/
+# Benchmark run artifacts: timestamped, machine-specific, and they embed raw
+# model replies. The harness and its fixtures are committed; its output is not.
+benchmarks/results/

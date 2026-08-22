@@ -1,6 +1,11 @@
 # tests/ — philosophy, fixtures, and the real-DB trap
 
-133 tests across eleven files (132 collected into the default run + 1 opt-in). `test_foundation.py`,
+249 tests across fifteen files (248 collected into the default run + 1 opt-in). The vision work added
+four: `test_grounding_bench.py` (the benchmark's deterministic half), `test_candidate_source.py`
+(candidate generation), `test_set_of_mark.py` (set-of-mark grounding), and
+`test_pending_confirmations.py` (the approval data model). None of the four makes a real model call —
+`test_grounding_bench.py` drives the harness in `--dry-run`, and the set-of-mark tests monkeypatch
+`_call_vision_model` exactly as the older vision tests do. `test_foundation.py`,
 `test_policy.py`, `test_memory_tools.py`, `test_browser_policy_tools.py`, `test_filesystem_tools.py`,
 `test_windows_control_tools.py`, `test_communication_tools.py`, `test_uia_resolver.py` and
 `test_perception_tools.py` are unit tests of individual pieces; `test_adversarial.py` probes whether
@@ -15,7 +20,11 @@ while it runs. Set `ORBIT_RUN_LIVE_UI_TESTS=1` to opt in, and don't be at the ke
 tests hit the real desktop (a real screenshot, the real foreground window). That's safe because
 perception is read-only by construction — nothing it does can move the mouse, send a keystroke, or
 change what's on screen, so unlike `test_windows_control_live.py` there's nothing disruptive to gate
-behind an opt-in flag. Content-specific assertions are avoided (e.g. PNG magic bytes and response
+behind an opt-in flag. The **vision-tier tests never make a real model call** — `_call_vision_model`
+is monkeypatched in every one of them. What they do exercise for real is the coordinate arithmetic
+and the actuation refusal, because those are the two things that can break without anyone noticing:
+a crop-offset bug returns answers wrong by a small constant, and a confidence regression would open
+a path from a visual guess to a real mouse click. Content-specific assertions are avoided (e.g. PNG magic bytes and response
 shape, not what the screenshot shows) so these stay stable regardless of whatever happens to be in
 the foreground when the suite runs.
 

@@ -3,10 +3,13 @@ state. Mirrors memory.py's/filesystem.py's/communication.py's connection
 pattern exactly.
 
 lane="headless" even though it inspects native windows: every tool here
-only READS (a screenshot, a UIA tree, foreground-window info) — nothing
-simulates input, so none of it needs orbit/task_manager.py's foreground
-lock. That's the entire point of Section 11's "perception free and
-always-on, actuation gated" split, and it's why this skill (unlike
+only READS (a screenshot, a UIA tree, foreground-window info, a vision
+model's opinion about where something is) — nothing simulates input, so
+none of it needs orbit/task_manager.py's foreground lock. That holds for
+perception_vision_locate too: it looks and reports, and its result is
+refused by windows-control's actuation gate rather than being a way in.
+That's the entire point of Section 11's "perception free and always-on,
+actuation gated" split, and it's why this skill (unlike
 windows_control.py) needs no lane gating in orbit/agent.py.
 """
 
@@ -43,6 +46,7 @@ def build_toolset(task_id: str = "") -> MCPToolset:
             "perception_get_state",
             "perception_get_uia_tree",
             "perception_find_element",
+            "perception_vision_locate",
             "perception_capture_screenshot",
             "perception_wait_for_visual_change",
         ],

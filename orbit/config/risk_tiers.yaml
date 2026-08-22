@@ -41,6 +41,7 @@ low:
   - perception_get_state              # read-only: foreground window/process + optional task status lookup
   - perception_get_uia_tree           # read-only: UI Automation tree dump, depth/node-capped
   - perception_find_element           # read-only resolution (UIA tier only in this build) — does not click or type anything itself
+  - perception_vision_locate          # read-only: screenshots a window and asks a vision model where something is; returns coordinates only, and its ElementRef is refused by windows-control's confidence gate
   - perception_capture_screenshot     # read-only: a screen/region capture, nothing is written to disk or actuated
   - perception_wait_for_visual_change # read-only: polls for a pixel diff, no input simulated
 

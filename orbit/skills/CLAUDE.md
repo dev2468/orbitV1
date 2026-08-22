@@ -48,7 +48,7 @@ Exposed today: `browser_open`, `browser_navigate`, `browser_snapshot`, `memory_s
 `fs_write_file`, `fs_move`, `fs_copy`, `fs_search`, `fs_create_dir`, `fs_get_metadata`, `email_draft`,
 `email_search`, `email_read`, `email_list_threads`, `calendar_list_events`, `calendar_create_event`,
 `perception_get_state`, `perception_get_uia_tree`, `perception_find_element`,
-`perception_capture_screenshot`, `perception_wait_for_visual_change`, and — only when
+`perception_capture_screenshot`, `perception_wait_for_visual_change`, `perception_vision_locate`, and — only when
 `lane="foreground"` — `windows_get_foreground_window`, `windows_wait`, `windows_scroll`,
 `windows_click`, `windows_drag`, `windows_type`, `windows_key`, `windows_open_app`.
 
