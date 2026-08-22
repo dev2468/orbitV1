@@ -41,6 +41,7 @@ import argparse
 import base64
 import json
 import math
+import os
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -70,6 +71,53 @@ from orbit.mcp_servers.perception_tools import (
 # Non-zero on purpose — see module docstring.
 _CROP_ORIGIN = (100, 50)
 
+# Which env var each provider needs, mirroring orbit/agent.py's
+# _REQUIRED_KEY_BY_PREFIX rather than inventing a second convention. Phase 6
+# adds arms on providers this project has never called, and a missing key
+# must fail with the exact line to add to .env — not as a run of timeouts
+# that looks like the model grounding badly.
+_REQUIRED_KEY_BY_PREFIX = {
+    "nvidia_nim/": "NVIDIA_NIM_API_KEY",
+    "groq/": "GROQ_API_KEY",
+    "deepseek/": "DEEPSEEK_API_KEY",
+    "anthropic/": "ANTHROPIC_API_KEY",
+    "openrouter/": "OPENROUTER_API_KEY",
+    "together_ai/": "TOGETHER_API_KEY",
+}
+
+
+def _api_key_for(model: str) -> str:
+    """Resolve the credential this model needs, or say exactly what is missing.
+
+    NVIDIA keeps going through perception_tools._nim_api_key so the benchmark
+    and the live tool read the key the same way (it also loads .env, which
+    matters in a subprocess). Everything else reads the environment directly.
+    """
+    if model.startswith("nvidia_nim/"):
+        return _nim_api_key()
+    for prefix, env_var in _REQUIRED_KEY_BY_PREFIX.items():
+        if model.startswith(prefix):
+            key = os.environ.get(env_var, "").strip()
+            if not key:
+                try:
+                    from dotenv import load_dotenv
+
+                    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+                    key = os.environ.get(env_var, "").strip()
+                except Exception:
+                    pass
+            if not key:
+                raise RuntimeError(
+                    f"{env_var} is not set, but arm model {model!r} needs it.\n"
+                    f"Add this line to the .env file in the project root:\n"
+                    f"    {env_var}=your-key-here"
+                )
+            return key
+    raise RuntimeError(
+        f"no provider key mapping for model {model!r} — add its prefix to "
+        "_REQUIRED_KEY_BY_PREFIX in benchmarks/grounding_bench.py"
+    )
+
 
 @dataclass
 class CallResult:
@@ -86,6 +134,7 @@ class CallResult:
     error: str | None
     raw_reply: str
     attempts: int = 1
+    model: str = ""
 
 
 def _offset(bounds: Bounds, origin: tuple[int, int]) -> Bounds:
@@ -159,7 +208,7 @@ def _call_model(image_b64: str, prompt: str, model: str, timeout_s: float) -> st
                 ],
             }
         ],
-        api_key=_nim_api_key(),
+        api_key=_api_key_for(model),
         max_tokens=400,
         timeout=timeout_s,
     )
@@ -304,6 +353,7 @@ def run_one(
         error=error,
         raw_reply=(reply or "")[:500],
         attempts=attempts,
+        model=model,
     )
 
 
@@ -329,6 +379,8 @@ def summarize(results: list[CallResult]) -> dict:
             }
         lat = sorted(r.latency_ms for r in rows)
         out[arm] = {
+            "model": rows[0].model if rows else None,
+            "total_latency_s": round(sum(r.latency_ms for r in rows) / 1000, 1),
             "hits": sum(1 for r in rows if r.hit),
             "total": len(rows),
             "rate": (sum(1 for r in rows if r.hit) / len(rows)) if rows else 0.0,

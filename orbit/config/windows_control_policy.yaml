@@ -31,3 +31,27 @@ blocked_key_combos:
 # "reverify" state Section 7 describes, anything under this line is a hard
 # stop today, not a softer retry path.
 min_actuation_confidence: 0.70
+
+# How long a human approval stays usable, in seconds.
+#
+# Short on purpose. An approval is consent about a SCREENSHOT OF A MOMENT:
+# the human looked at a box drawn over a window and said "yes, that one".
+# Windows move, dialogs open, focus changes. A token that outlived the screen
+# it was granted against would aim an approved click at whatever happens to be
+# there now — which is a worse failure than refusing, because it carries a
+# human's yes.
+#
+# 120s is sized for "a person is sitting there answering", not for queued or
+# deferred approval. Raising it materially weakens the guarantee; the GUI
+# approval path does not need it raised, because a human approving in the
+# dashboard is answering just as promptly.
+approval_token_ttl_seconds: 120
+
+# How long to wait for the GUI dashboard to answer a confirmation when there
+# is no interactive console to ask on. 0 disables the GUI channel.
+#
+# Default 0 on purpose. A non-zero wait makes every unattended run (eval, CI,
+# a scheduled task) block for this long on each confirmation before failing
+# closed — turning a fast, honest refusal into a hang. Raise it only when a
+# human is actually watching the dashboard.
+approval_gui_wait_seconds: 0

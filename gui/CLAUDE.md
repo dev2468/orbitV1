@@ -18,13 +18,30 @@ submission belong to `TaskManager`, which owns the in-memory task/token registry
 would change a row's status without touching the running coroutine, leaving the two out of sync.
 Any control path has to reach the owning process, which does not exist yet.
 
-## The confirmation channel that isn't built
+## The confirmation channel, now built
 
-This is the natural home for the missing piece: high-risk tools are currently blocked outright with
-`confirmation_required` rather than queued for approval, precisely because there is no channel a
-human decision can arrive on. When one is built it wires into
-`SafetyPlugin.before_tool_callback` (`orbit/policy.py`) and it must originate here — the whole point
-is that a human saw the actual action. Until then, do not relax the block to make the GUI simpler.
+`ConfirmationPanel` renders the oldest row in `pending_confirmations` — its stored screenshot with
+the candidate box drawn over it — and offers Approve / Reject. This is the piece this file used to
+say was missing, and it is here for the stated reason: the whole point is that **a human saw the
+actual action**.
+
+**Why writing to the DB is allowed here, when cancellation still is not.** The rule above stands:
+task status is owned by `TaskManager`'s in-memory registry, so a direct write would desync the two.
+`pending_confirmations` has no in-memory owner — the waiting process is *polling that table* for an
+answer, so the table IS the channel, exactly like the task list is the channel for display. The
+buttons call `db.resolve_pending_confirmation` and **nothing else**: no task rows, no event rows, no
+status changes. That restriction is what keeps this safe, so do not widen it.
+
+Approving mints a short-lived single-use token (`approval_token_ttl_seconds`). It does **not** raise
+the target's confidence or lower `min_actuation_confidence` — a second click needs a second yes.
+
+The waiting side only listens when `approval_gui_wait_seconds` is non-zero, and it defaults to **0**.
+That is deliberate: a non-zero wait makes every unattended run (eval, CI, a scheduled task) block for
+that long on each confirmation before failing closed, turning a fast honest refusal into a hang. Turn
+it on when a human is actually watching this window.
+
+A `KeyError` on resolve is swallowed: it means the row was already decided — by the REPL asker, or a
+second dashboard — and refreshing shows the truth. That is a race, not an error.
 
 ## Two entry points, one sys.path hack
 

@@ -1,9 +1,10 @@
 # tests/ — philosophy, fixtures, and the real-DB trap
 
-249 tests across fifteen files (248 collected into the default run + 1 opt-in). The vision work added
-four: `test_grounding_bench.py` (the benchmark's deterministic half), `test_candidate_source.py`
+279 tests across sixteen files (278 collected into the default run + 1 opt-in). The vision work added
+five: `test_grounding_bench.py` (the benchmark's deterministic half), `test_candidate_source.py`
 (candidate generation), `test_set_of_mark.py` (set-of-mark grounding), and
-`test_pending_confirmations.py` (the approval data model). None of the four makes a real model call —
+`test_pending_confirmations.py` (the approval data model) and `test_confirmation_flow.py` (the REPL/GUI approval channel, with the
+console asker injected so none of it needs a TTY). None of the five makes a real model call —
 `test_grounding_bench.py` drives the harness in `--dry-run`, and the set-of-mark tests monkeypatch
 `_call_vision_model` exactly as the older vision tests do. `test_foundation.py`,
 `test_policy.py`, `test_memory_tools.py`, `test_browser_policy_tools.py`, `test_filesystem_tools.py`,

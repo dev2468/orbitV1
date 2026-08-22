@@ -75,19 +75,33 @@ async def windows_scroll(direction: str, amount: int = 3, target: Optional[dict]
 
 
 @mcp.tool()
-async def windows_click(target: dict, task_id: str = "") -> Any:
+async def windows_click(target: dict, task_id: str = "", approval_token: str = "") -> Any:
     """Click a UI element. target: {window_handle, automation_id} or
-    {window_handle, name, control_type?}. Raw {x, y} is accepted but always
-    refused — no confirmation channel exists for vision-tier clicks."""
-    result = await click_tool.execute({"target": target}, task_id=_resolve_task_id(task_id))
+    {window_handle, name, control_type?}. A target below the actuation
+    confidence floor (raw {x, y}, or a vision-tier ElementRef) is refused
+    unless it carries a one-shot approval_token, which SafetyPlugin obtains
+    from a human before the call reaches here — do not invent one."""
+    result = await click_tool.execute(
+        {"target": target, "approval_token": approval_token or None},
+        task_id=_resolve_task_id(task_id),
+    )
     return _payload(result)
 
 
 @mcp.tool()
-async def windows_drag(from_target: dict, to_target: dict, task_id: str = "") -> Any:
-    """Click-drag-release from one resolved target to another."""
+async def windows_drag(
+    from_target: dict, to_target: dict, task_id: str = "", approval_token: str = ""
+) -> Any:
+    """Click-drag-release from one resolved target to another. Both endpoints
+    are confidence-checked independently; one approval_token covers the whole
+    drag, since a drag is one action."""
     result = await drag_tool.execute(
-        {"from_target": from_target, "to_target": to_target}, task_id=_resolve_task_id(task_id)
+        {
+            "from_target": from_target,
+            "to_target": to_target,
+            "approval_token": approval_token or None,
+        },
+        task_id=_resolve_task_id(task_id),
     )
     return _payload(result)
 

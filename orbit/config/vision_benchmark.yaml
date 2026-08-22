@@ -74,3 +74,29 @@ run:
   # Where results land. One JSON per run, timestamped, so phases can be
   # diffed against each other rather than overwriting one another.
   results_dir: benchmarks/results
+
+# --- Phase 6: model comparison ---------------------------------------------
+#
+# Alternate grounding models, all on the set_of_mark prompt so the only thing
+# varying between them is the model. Commented out rather than deleted: each
+# needs a credential this project does not currently hold, and an arm that
+# fails every call on a missing key would report as a 0% hit-rate — a
+# configuration gap wearing the costume of a result.
+#
+# Uncomment an arm once its key is in .env. benchmarks/grounding_bench.py's
+# _REQUIRED_KEY_BY_PREFIX (mirroring orbit/agent.py's) fails loudly with the
+# exact line to add, rather than letting it look like bad grounding.
+#
+#   - id: qwen2_vl_som
+#     prompt_shape: set_of_mark
+#     model: openrouter/qwen/qwen-2-vl-72b-instruct   # OPENROUTER_API_KEY
+#
+#   - id: claude_computer_use_som
+#     prompt_shape: set_of_mark
+#     model: anthropic/claude-sonnet-4-5              # ANTHROPIC_API_KEY
+#
+# Run the comparison with every arm enabled:
+#   venv\Scripts\python.exe -m benchmarks.grounding_bench
+# The report prints hit-rate, median miss-distance and latency per arm; the
+# JSON under benchmarks/results/ carries per-call latency and attempt counts
+# for the cost side of the table.

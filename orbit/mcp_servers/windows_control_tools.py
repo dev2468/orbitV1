@@ -137,17 +137,78 @@ def _resolve_click_target(target: dict) -> ElementRef:
     return resolve_uia_element(window_handle, automation_id=automation_id, name=name, control_type=control_type)
 
 
-def _require_confidence(element: ElementRef) -> None:
+def _require_confidence(element: ElementRef, approval_token: Optional[str] = None) -> None:
+    """Gate actuation on confidence, or on a one-shot human approval.
+
+    THE FLOOR IS UNCHANGED AND THE ELEMENT'S CONFIDENCE IS UNCHANGED. A
+    vision-sourced ElementRef is still scored 0.50 and still fails the
+    comparison below; what an approval_token supplies is separate,
+    per-action permission for the single call a human actually looked at.
+    Nothing here raises a score, lowers the floor, or special-cases
+    source="vision" — a guessed target remains a guessed target, and the
+    next one needs its own yes.
+
+    The token is validated HERE, in the tool process, and not merely trusted
+    from whoever called us. `db.consume_approval_token` spends it: it is
+    refused if unknown, already spent, expired, or attached to a row that
+    was not approved. So a token cannot authorise a second action even if it
+    is replayed by a caller that kept a copy.
+    """
     policy = load_windows_control_policy()
     floor = policy.get("min_actuation_confidence", 0.70)
-    if element.confidence < floor:
+    if element.confidence >= floor:
+        return
+
+    if approval_token:
+        approved = db.consume_approval_token(approval_token)
+        if approved is not None:
+            return
         raise ClassifiedToolError(
             "permission_denied",
-            f"target resolved at confidence {element.confidence:.2f} (source={element.source}), "
-            f"below this build's floor of {floor:.2f} — there is no confirmation channel to route a "
-            "lower-confidence action through, so this is refused outright. Provide a more specific "
-            "locator (automation_id) instead of raw coordinates.",
+            "the approval token supplied with this action is not usable — it is unknown, "
+            "already spent, or expired. Approvals are single-use and short-lived by design. "
+            "Do not reuse a token; request confirmation again.",
         )
+
+    raise ClassifiedToolError(
+        "permission_denied",
+        f"target resolved at confidence {element.confidence:.2f} (source={element.source}), "
+        f"below this build's floor of {floor:.2f}. An action this uncertain needs explicit "
+        "human approval, which is requested before the call reaches this tool — reaching here "
+        "without an approval token means it was not granted. Provide a more specific locator "
+        "(automation_id) instead of raw coordinates.",
+    )
+
+
+def _require_confidence_pair(
+    a: ElementRef, b: ElementRef, approval_token: Optional[str] = None
+) -> None:
+    """Gate a two-endpoint action on one approval.
+
+    Both endpoints are still checked against the floor independently — the
+    catalog's "higher risk if EITHER endpoint is vision-tier" rule is
+    unchanged. What is shared is the single-use token: it is consumed once,
+    up front, and then covers whichever endpoints needed covering. Calling
+    _require_confidence twice with the same token would spend it on the
+    first endpoint and refuse the second, turning a granted approval into a
+    confusing denial.
+    """
+    policy = load_windows_control_policy()
+    floor = policy.get("min_actuation_confidence", 0.70)
+    below = [e for e in (a, b) if e.confidence < floor]
+    if not below:
+        return
+
+    if approval_token and db.consume_approval_token(approval_token) is not None:
+        return
+
+    worst = min(below, key=lambda e: e.confidence)
+    raise ClassifiedToolError(
+        "permission_denied",
+        f"drag endpoint resolved at confidence {worst.confidence:.2f} "
+        f"(source={worst.source}), below this build's floor of {floor:.2f}, and no usable "
+        "approval token accompanied the action. Approvals are single-use and short-lived.",
+    )
 
 
 # --- key combo parsing --------------------------------------------------------
@@ -346,7 +407,7 @@ class ClickTool(BaseTool):
 
     async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
         element = _resolve_click_target(args["target"])
-        _require_confidence(element)
+        _require_confidence(element, args.get("approval_token"))
         x, y = element.center()
         pywinauto_mouse.click(button="left", coords=(x, y))
         return {"clicked": element.model_dump()}, element.confidence
@@ -362,8 +423,14 @@ class DragTool(BaseTool):
     async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
         from_element = _resolve_click_target(args["from_target"])
         to_element = _resolve_click_target(args["to_target"])
-        _require_confidence(from_element)
-        _require_confidence(to_element)
+        # ONE approval covers ONE action, and a drag is one action with two
+        # ends. Checking each endpoint with the same token separately would
+        # spend it on the first and then refuse the second, because tokens
+        # are single-use — so the pair is validated together and the token
+        # is consumed exactly once.
+        _require_confidence_pair(
+            from_element, to_element, args.get("approval_token")
+        )
 
         fx, fy = from_element.center()
         tx, ty = to_element.center()

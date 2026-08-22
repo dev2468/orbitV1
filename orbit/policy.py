@@ -407,6 +407,39 @@ class SafetyPlugin(BasePlugin):
                 ),
             }
 
+        # Human-in-the-loop confirmation for a position-actuating call whose
+        # target sits below the actuation floor (a vision guess, or a raw
+        # {x, y}). This is the ONLY path by which such a call can proceed,
+        # and it proceeds by carrying a one-shot approval token — never by
+        # the floor moving or the element's confidence changing.
+        #
+        # It happens here rather than inside windows_click because every
+        # tool runs in an MCP server subprocess whose stdin IS the protocol
+        # transport; a server cannot ask a human anything. See
+        # orbit/confirmation.py. The tool still re-validates the token
+        # itself, so this is the asking, not the enforcing.
+        from orbit import confirmation
+
+        pending_target = confirmation.target_needs_confirmation(tool.name, tool_args)
+        if pending_target is not None:
+            token, confirmation_id = confirmation.request_confirmation(
+                task_id, tool.name, tool_args, pending_target
+            )
+            if not token:
+                logger.info("confirmation denied for %s (task %s)", tool.name, task_id)
+                return {
+                    "error": "permission_denied",
+                    "message": (
+                        f"'{tool.name}' was not approved by the user "
+                        f"(confirmation {confirmation_id}). Do not retry this action "
+                        "and do not try to route around it — tell the user it was "
+                        "declined and stop."
+                    ),
+                }
+            # Injected into the args the tool actually receives. Mutating in
+            # place is deliberate: ADK passes this dict through to the tool.
+            tool_args["approval_token"] = token
+
         # medium/low: allowed, logged (Section 7: "Logged, no confirm").
         #
         # EVENT WRITE SITE 1 of 3. A single MCP tool call currently produces
