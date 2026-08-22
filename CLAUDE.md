@@ -31,7 +31,7 @@ venv\Scripts\python.exe -m orbit.run_task find the cheapest 65 inch tv   # one-s
 venv\Scripts\python.exe -m orbit.run_task --foreground open notepad ...  # opts into lane=foreground — the ONLY way windows-control tools are reachable (one-shot only, not inside the REPL)
 venv\Scripts\python.exe -m orbit.run_task --list-models                  # known-good models + active one
 venv\Scripts\python.exe gui\main.py                                      # read-only task dashboard
-venv\Scripts\python.exe -m pytest tests\ -q                              # 133 tests (some hit the network; a live-UI windows-control test is opt-in, see tests/CLAUDE.md)
+venv\Scripts\python.exe -m pytest tests\ -q                              # 152 tests (some hit the network; a live-UI windows-control test is opt-in, see tests/CLAUDE.md)
 venv\Scripts\python.exe -m eval.run_eval                                 # eval harness against live sites
 ```
 
@@ -107,12 +107,39 @@ Design intent and the section numbers the code cites live in
 `Claude Code Prompts - Building the MCP Tool Layer.md` (Prompts 0–8). The code refers to both by
 number; when a docstring says "Section 7" or "Prompt 4", that is where it points.
 
+
+## The vision tier, and the line it must not cross
+
+`perception_vision_locate` is implemented (the grounding spike the tool catalog demanded has been
+run — its result and the representation decision it produced are recorded in the VISION TIER comment
+block in `orbit/mcp_servers/perception_tools.py`, next to the code). It screenshots a window, sends
+it to `nvidia_nim/google/gemma-4-31b-it` via its own LiteLLM call, and returns an `ElementRef` with
+`source="vision"`. It is the only tier that can locate a control with **no UI Automation
+representation at all** — a game, a `<canvas>` app, custom-drawn UI.
+
+**It is a read, and it must stay one.** Every `ElementRef` it produces carries
+`Confidence.VISION_INFERRED` (0.50), below `windows_control_policy.yaml`'s
+`min_actuation_confidence` (0.70), so `windows_click`/`windows_drag` refuse it exactly as they
+refuse a raw `{x, y}`. That is deliberate and load-bearing: there is no confirmation channel in this
+build through which a human could approve a visually-guessed click, so a guessed click has no safe
+path to the OS. `tests/test_perception_tools.py::test_vision_sourced_element_ref_is_still_refused_by_actuation`
+pins it against the real policy file and the real resolver. Do not "fix" that refusal by raising the
+confidence, lowering the floor, or adding a bypass — the tier's value is telling the user what is on
+screen, not clicking it.
+
+The model's own self-reported confidence, when it volunteers one, is recorded under
+`element.state["vision"]["model_confidence"]` for debugging and is never promoted into the
+`confidence` field the gate reads.
+
+`perception_find_element` gained a `"vision"` tier, **opt-in only**: it fires when the caller passes
+`tier_order=["uia","vision"]` and a `query.description`, never automatically on a UIA miss. Reasons
+are documented on `FindElementTool` — chiefly that it turns a millisecond-scale local lookup into a
+hosted model call, and that the two tiers do not even take the same kind of input.
+
 ## Known open issues
 
 Do not spend a session rediscovering these.
 
-- **Not a git repository.** No history, no branches, nothing to diff against. `.gitignore` exists
-  and is ready, but `git init` has never been run.
 - **`data/orbit.db`'s `memory` table holds only attack payloads.** All 3 rows are
   `provenance='external'` prompt-injection seeds written by `tests/test_adversarial.py`. Nothing
   in real use has ever written a memory row. Do not read it as representative data.
@@ -128,15 +155,11 @@ Do not spend a session rediscovering these.
   and correct; nothing invokes them, so retention never runs.
 - **`tasks.source_urls` is never written.** It is created as `'[]'` and read back by
   `memory_search_tasks`, so every past task reports no sources.
-- **screen-perception has no OCR or vision tier.** `perception_find_element` only resolves the UIA
-  tier — a control with no UI Automation representation (some custom-drawn UI) simply cannot be
-  resolved by `perception_find_element` or targeted by `windows_click`/`windows_drag` in this build.
-  `perception_read_text_region` (OCR) and `perception_vision_locate` are not implemented at all: no
-  OCR engine is installed (Tesseract needs a system binary; PaddleOCR/EasyOCR are multi-hundred-MB ML
+- **screen-perception has no OCR tier.** `perception_read_text_region` is not implemented: no OCR
+  engine is installed (Tesseract needs a system binary; PaddleOCR/EasyOCR are multi-hundred-MB ML
   stacks — a bigger, more consequential install than the small pure-Python `mss` library actually
-  added), and the vision-tier tool's own catalog entry explicitly says not to guess its signature
-  ahead of a grounding spike that has never run in this build. See
-  `orbit/mcp_servers/perception_tools.py`'s module docstring.
+  added). `perception_find_element` still reports `"ocr"` in `tiers_unavailable` rather than
+  pretending otherwise. The **vision tier now exists** — see below.
 - **The communication server has no real mailbox connected.** `LocalMailBackend`
   (`orbit/mcp_servers/communication_backend.py`) is a genuinely-working local SQLite stand-in, not a
   pile of stubs, but nothing sent through it reaches a real inbox and nothing read through it came from

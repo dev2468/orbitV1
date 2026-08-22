@@ -1,5 +1,10 @@
 Table of Contents
 
+> **Note (voice removed):** The voice subsystem this document describes (push-to-talk hotkey,
+> Deepgram/faster-whisper STT, Kokoro TTS) was removed outright on the `remove-voice-integration`
+> git branch and no longer exists in the tree. Section numbers below are unchanged and still cited
+> throughout the codebase. See the root `CLAUDE.md` for the current state of the system.
+
 # AI Assistant — System Architecture & Design Spec
 
 *Foundational build document. Locks in decisions made through this design process; Section 12 flags what's genuinely still open. Section 14 tracks hardening requirements pulled from the Aug 2026 tech-stack review — these are now real requirements, not just review notes. LLM provider strategy: **NVIDIA NIM (Nemotron 3.5 Lightning) primary as of 2026-08-13**, Claude for escalation and critique — see Section 5.*
