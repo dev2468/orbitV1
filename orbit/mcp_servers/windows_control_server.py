@@ -24,6 +24,7 @@ from orbit import db
 from orbit.mcp_servers.windows_control_tools import (
     _resolve_task_id,
     click_tool,
+    clipboard_copy_image_tool,
     drag_tool,
     focus_window_tool,
     get_foreground_window_tool,
@@ -137,6 +138,19 @@ async def windows_focus_window(window_handle: int, task_id: str = "") -> Any:
     channel — expect confirmation_required, not an actual focus change."""
     result = await focus_window_tool.execute(
         {"window_handle": window_handle}, task_id=_resolve_task_id(task_id)
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def windows_clipboard_copy_image(
+    image_path: str = "", image_base64: str = "", task_id: str = ""
+) -> Any:
+    """Place an image on the clipboard so Ctrl+V pastes it in Word, Paint,
+    etc. Provide image_path OR image_base64 (from perception_capture_screenshot)."""
+    result = await clipboard_copy_image_tool.execute(
+        {"image_path": image_path or None, "image_base64": image_base64 or None},
+        task_id=_resolve_task_id(task_id),
     )
     return _payload(result)
 

@@ -30,27 +30,35 @@ the wrong interpreter or nothing at all.
 
 ## tool_filter: every name is there on purpose
 
-Playwright MCP's full ~24-tool surface measurably degrades tool-calling reliability on mid-tier
-models — a curated 3-tool subset worked where the unfiltered list produced malformed and
-hallucinated calls. Surface area still costs reliability even against the proxy, so:
+The original 3-tool browser filter (open/navigate/snapshot) was expanded with core interaction
+tools: click, type, select_option, press_key (for scrolling), and go_back. The filter is
+deliberately kept small — Nemotron 3.5 Lightning (3B active params) degrades on large tool surfaces,
+and the original spec already warned about this with Playwright MCP's full 24-tool surface.
+Still held back:
 
-- **`browser_extract` is held back** for the same reason `browser_evaluate` was: it takes a raw JS
-  expression and models reach for it reflexively when the snapshot already contains the answer.
-  Never expose it.
-- **`browser_close` is held back** even though it is implemented and callable internally. Measured
-  runs had the model skipping it 2 times out of 4, so it was never a teardown guarantee — only an
-  occasional shortcut that still cost surface area. Teardown is the reaper's job now.
-- **`memory_get_task` is held back**: it is mainly useful once the model already has a task_id in
-  hand, and every extra tool costs selection reliability.
+- **`browser_extract`**: takes a raw JS expression; models reach for it when snapshot suffices.
+- **`browser_close`**: teardown is the reaper's job (model skipped it 2/4 measured runs).
+- **`browser_take_screenshot`**: returns image data the text model can't process; use
+  `browser_snapshot` for text or `perception_capture_screenshot` for real screenshots.
+- **`browser_drag`**: rarely needed, complex 4-ref params.
+- **`browser_hover`**: rarely needed for research tasks.
+- **`browser_tab_new/list/select/close`**: the model can just `browser_navigate` to a new URL;
+  tab management adds 4 tools for minimal benefit on a small model.
+- **`browser_go_forward`**: back is used far more than forward.
+- **`browser_handle_dialog`**: edge case, not common in research.
+- **`memory_get_task`**: mainly useful once the model already has a task_id in hand.
 
-Exposed today: `browser_open`, `browser_navigate`, `browser_snapshot`, `memory_search_tasks`,
-`memory_get_context`, `memory_get_policy`, `memory_write`, `fs_list_dir`, `fs_read_file`,
-`fs_write_file`, `fs_move`, `fs_copy`, `fs_search`, `fs_create_dir`, `fs_get_metadata`, `email_draft`,
-`email_search`, `email_read`, `email_list_threads`, `calendar_list_events`, `calendar_create_event`,
+Exposed today: `browser_open`, `browser_navigate`, `browser_snapshot`, `browser_click`,
+`browser_type`, `browser_select_option`, `browser_press_key`, `browser_go_back`,
+`memory_search_tasks`, `memory_get_context`,
+`memory_get_policy`, `memory_write`, `fs_list_dir`, `fs_read_file`, `fs_write_file`, `fs_move`,
+`fs_copy`, `fs_search`, `fs_create_dir`, `fs_get_metadata`, `email_draft`, `email_search`,
+`email_read`, `email_list_threads`, `calendar_list_events`, `calendar_create_event`,
 `perception_get_state`, `perception_get_uia_tree`, `perception_find_element`,
 `perception_capture_screenshot`, `perception_wait_for_visual_change`, `perception_vision_locate`, and — only when
 `lane="foreground"` — `windows_get_foreground_window`, `windows_wait`, `windows_scroll`,
-`windows_click`, `windows_drag`, `windows_type`, `windows_key`, `windows_open_app`.
+`windows_click`, `windows_drag`, `windows_type`, `windows_key`, `windows_open_app`,
+`windows_clipboard_copy_image`.
 
 **`filesystem.py` holds `fs_delete` back**, **`windows_control.py` holds `windows_focus_window`
 back**, and **`communication.py` holds `email_send` back**, each from its own `tool_filter`, even

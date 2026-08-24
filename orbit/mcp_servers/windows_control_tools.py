@@ -38,7 +38,11 @@ half-implemented. Horizontal scroll is unsupported for the same reason.
 from __future__ import annotations
 
 import asyncio
+import base64
+import ctypes
 import os
+import struct
+import tempfile
 import time
 from typing import Any, Optional
 
@@ -306,6 +310,102 @@ def _set_clipboard_text(text: str) -> None:
         win32clipboard.CloseClipboard()
 
 
+# --- image-to-clipboard via GDI+ (no Pillow) ---------------------------------
+# Windows GDI+ handles PNG, JPG, BMP, GIF, TIFF natively.  The output is a
+# DIB (BITMAPINFOHEADER + bottom-up 32bpp pixels) for CF_DIB, the one
+# clipboard format every Windows app accepts for Ctrl+V image paste.
+
+
+def _image_to_dib(image_path: str) -> tuple[bytes, int, int]:
+    """Load an image file and return (DIB bytes, width, height)."""
+    gdiplus = ctypes.windll.gdiplus
+    gdi32 = ctypes.windll.gdi32
+    user32 = ctypes.windll.user32
+
+    class _StartupInput(ctypes.Structure):
+        _fields_ = [
+            ("GdiplusVersion", ctypes.c_uint32),
+            ("DebugEventCallback", ctypes.c_void_p),
+            ("SuppressBackgroundThread", ctypes.c_int),
+            ("SuppressExternalCodecs", ctypes.c_int),
+        ]
+
+    token = ctypes.c_ulong()
+    si = _StartupInput(1, None, 0, 0)
+    if gdiplus.GdiplusStartup(ctypes.byref(token), ctypes.byref(si), None) != 0:
+        raise ClassifiedToolError("tool_failure", "GDI+ initialization failed")
+
+    try:
+        bitmap = ctypes.c_void_p()
+        status = gdiplus.GdipCreateBitmapFromFile(
+            ctypes.c_wchar_p(image_path), ctypes.byref(bitmap)
+        )
+        if status != 0:
+            raise ClassifiedToolError(
+                "state_failure",
+                f"cannot load image {image_path!r} (GDI+ status {status})",
+            )
+
+        try:
+            w = ctypes.c_uint()
+            h = ctypes.c_uint()
+            gdiplus.GdipGetImageWidth(bitmap, ctypes.byref(w))
+            gdiplus.GdipGetImageHeight(bitmap, ctypes.byref(h))
+            width, height = w.value, h.value
+
+            hbitmap = ctypes.c_void_p()
+            gdiplus.GdipCreateHBITMAPFromBitmap(
+                bitmap, ctypes.byref(hbitmap), 0x00FFFFFF
+            )
+            if not hbitmap.value:
+                raise ClassifiedToolError(
+                    "tool_failure", "GDI+ failed to create HBITMAP from image"
+                )
+
+            try:
+                bpp = 32
+                pixel_size = width * (bpp // 8) * height
+                header = struct.pack(
+                    "<IiiHHIIiiII",
+                    40, width, height, 1, bpp, 0, pixel_size, 0, 0, 0, 0,
+                )
+
+                class _BitmapInfoHeader(ctypes.Structure):
+                    _fields_ = [
+                        ("biSize", ctypes.c_uint32),
+                        ("biWidth", ctypes.c_int32),
+                        ("biHeight", ctypes.c_int32),
+                        ("biPlanes", ctypes.c_uint16),
+                        ("biBitCount", ctypes.c_uint16),
+                        ("biCompression", ctypes.c_uint32),
+                        ("biSizeImage", ctypes.c_uint32),
+                        ("biXPelsPerMeter", ctypes.c_int32),
+                        ("biYPelsPerMeter", ctypes.c_int32),
+                        ("biClrUsed", ctypes.c_uint32),
+                        ("biClrImportant", ctypes.c_uint32),
+                    ]
+
+                bmi = _BitmapInfoHeader(
+                    40, width, height, 1, bpp, 0, pixel_size, 0, 0, 0, 0
+                )
+                pixels = ctypes.create_string_buffer(pixel_size)
+                hdc = user32.GetDC(0)
+                try:
+                    gdi32.GetDIBits(
+                        hdc, hbitmap, 0, height, pixels, ctypes.byref(bmi), 0
+                    )
+                finally:
+                    user32.ReleaseDC(0, hdc)
+
+                return header + pixels.raw, width, height
+            finally:
+                gdi32.DeleteObject(hbitmap)
+        finally:
+            gdiplus.GdipDisposeImage(bitmap)
+    finally:
+        gdiplus.GdiplusShutdown(token)
+
+
 # --- tools --------------------------------------------------------------------
 
 
@@ -534,6 +634,67 @@ class FocusWindowTool(BaseTool):
         return window_snapshot(window_handle), Confidence.API_SUCCESS
 
 
+class ClipboardCopyImageTool(BaseTool):
+    """windows_clipboard_copy_image — places an image on the Windows clipboard
+    as CF_DIB so Ctrl+V pastes it in Word, Paint, etc.  Accepts image_path
+    (a file on disk) or image_base64 (raw data from
+    perception_capture_screenshot).  Unlike windows_type's internal clipboard
+    use, does NOT restore the clipboard afterward — the image must stay there
+    for the subsequent Ctrl+V."""
+
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        image_path = args.get("image_path")
+        image_b64 = args.get("image_base64")
+
+        if not image_path and not image_b64:
+            raise ClassifiedToolError(
+                "reasoning_failure",
+                "provide either image_path or image_base64, not neither",
+            )
+        if image_path and image_b64:
+            raise ClassifiedToolError(
+                "reasoning_failure",
+                "provide either image_path or image_base64, not both",
+            )
+
+        tmp_path = None
+        try:
+            if image_b64:
+                raw = base64.b64decode(image_b64)
+                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                tmp.write(raw)
+                tmp.close()
+                tmp_path = tmp.name
+                load_path = tmp_path
+            else:
+                if not os.path.isfile(image_path):
+                    raise ClassifiedToolError(
+                        "state_failure", f"image not found: {image_path!r}"
+                    )
+                load_path = os.path.abspath(image_path)
+
+            dib_data, width, height = _image_to_dib(load_path)
+
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardData(8, dib_data)  # CF_DIB = 8
+            finally:
+                win32clipboard.CloseClipboard()
+
+            return {
+                "copied": True,
+                "width": width,
+                "height": height,
+            }, Confidence.API_SUCCESS
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+
 def _metadata(name: str, description: str, **overrides) -> ToolMetadata:
     fields = {**_MEDIUM_FOREGROUND, **overrides}
     return ToolMetadata(name=name, description=description, **fields)
@@ -620,5 +781,15 @@ focus_window_tool = FocusWindowTool(
         risk_tier="high",
         requires_confirmation=True,
         is_destructive=True,
+    )
+)
+clipboard_copy_image_tool = ClipboardCopyImageTool(
+    _metadata(
+        "windows_clipboard_copy_image",
+        "Place an image on the Windows clipboard (CF_DIB) so Ctrl+V "
+        "pastes it in Word, Paint, etc. Provide image_path for a file "
+        "on disk, or image_base64 for raw data from "
+        "perception_capture_screenshot.",
+        risk_tier="low",
     )
 )

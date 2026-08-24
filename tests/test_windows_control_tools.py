@@ -244,3 +244,95 @@ def test_foreground_agent_has_windows_control_tools_and_instructions():
     ]
     assert any("windows_control_server" in str(args) for args in server_args)
     assert "windows_get_foreground_window" in agent.instruction
+
+
+# --- clipboard image tool ---------------------------------------------------
+
+
+def _tiny_png() -> bytes:
+    """Minimal valid 1x1 red PNG — no dependencies beyond stdlib."""
+    import struct as s
+    import zlib
+
+    def _chunk(ctype: bytes, data: bytes) -> bytes:
+        c = ctype + data
+        return s.pack(">I", len(data)) + c + s.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = _chunk(b"IHDR", s.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+    raw = b"\x00\xff\x00\x00"  # filter=none + R G B
+    idat = _chunk(b"IDAT", zlib.compress(raw))
+    iend = _chunk(b"IEND", b"")
+    return sig + ihdr + idat + iend
+
+
+@pytest.mark.asyncio
+async def test_clipboard_copy_image_rejects_neither_arg():
+    caller = db.create_task("caller")
+    result = await wc_tools.clipboard_copy_image_tool.execute({}, task_id=caller)
+    assert result.ok is False
+    assert result.error.kind == "reasoning_failure"
+
+
+@pytest.mark.asyncio
+async def test_clipboard_copy_image_rejects_both_args():
+    caller = db.create_task("caller")
+    result = await wc_tools.clipboard_copy_image_tool.execute(
+        {"image_path": "x.png", "image_base64": "abc"}, task_id=caller
+    )
+    assert result.ok is False
+    assert result.error.kind == "reasoning_failure"
+
+
+@pytest.mark.asyncio
+async def test_clipboard_copy_image_rejects_nonexistent_file():
+    caller = db.create_task("caller")
+    result = await wc_tools.clipboard_copy_image_tool.execute(
+        {"image_path": "C:\\definitely_not_a_real_file.png"}, task_id=caller
+    )
+    assert result.ok is False
+    assert result.error.kind == "state_failure"
+
+
+@pytest.mark.asyncio
+async def test_clipboard_copy_image_from_file(tmp_path):
+    caller = db.create_task("caller")
+    png_file = tmp_path / "test.png"
+    png_file.write_bytes(_tiny_png())
+
+    result = await wc_tools.clipboard_copy_image_tool.execute(
+        {"image_path": str(png_file)}, task_id=caller
+    )
+    assert result.ok
+    assert result.data["copied"] is True
+    assert result.data["width"] == 1
+    assert result.data["height"] == 1
+
+
+@pytest.mark.asyncio
+async def test_clipboard_copy_image_from_base64():
+    import base64
+
+    caller = db.create_task("caller")
+    b64 = base64.b64encode(_tiny_png()).decode()
+
+    result = await wc_tools.clipboard_copy_image_tool.execute(
+        {"image_base64": b64}, task_id=caller
+    )
+    assert result.ok
+    assert result.data["width"] == 1
+    assert result.data["height"] == 1
+
+
+def test_clipboard_copy_image_is_registered_low_tier():
+    from orbit.policy import load_risk_tiers
+
+    tiers = load_risk_tiers()
+    assert tiers.get("windows_clipboard_copy_image") == "low"
+
+
+def test_clipboard_copy_image_is_in_the_tool_filter():
+    from orbit.skills import windows_control as wc_skill
+
+    toolset = wc_skill.build_toolset(task_id="probe")
+    assert "windows_clipboard_copy_image" in toolset.tool_filter

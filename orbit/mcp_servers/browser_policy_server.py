@@ -27,13 +27,27 @@ from mcp.server.fastmcp import FastMCP
 from orbit import db
 from orbit.mcp_servers.browser_policy_tools import (
     aclose_all_sessions,
+    browser_type_tool,
+    click_tool,
     close_session_tool,
+    drag_tool,
     extract_tool,
+    go_back_tool,
+    go_forward_tool,
+    handle_dialog_tool,
+    hover_tool,
     navigate_tool,
     open_session_tool,
+    press_key_tool,
     resolve_task_id,
+    select_option_tool,
     session_reaper_loop,
     snapshot_tool,
+    tab_close_tool,
+    tab_list_tool,
+    tab_new_tool,
+    tab_select_tool,
+    take_screenshot_tool,
 )
 
 @asynccontextmanager
@@ -119,6 +133,154 @@ async def browser_extract(session_id: str, js_expression: str, task_id: str = ""
     """Extract structured data via a JS expression, wrapped as untrusted content."""
     result = await extract_tool.execute(
         {"session_id": session_id, "js_expression": js_expression},
+        task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_click(session_id: str, element: str, ref: str, task_id: str = "") -> Any:
+    """Click an element on the page. 'element' is a human-readable description,
+    'ref' is the exact element reference from browser_snapshot."""
+    result = await click_tool.execute(
+        {"session_id": session_id, "element": element, "ref": ref},
+        task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_type(
+    session_id: str, element: str, ref: str, text: str,
+    submit: bool = False, task_id: str = "",
+) -> Any:
+    """Type text into an input field. Set submit=true to press Enter after."""
+    result = await browser_type_tool.execute(
+        {"session_id": session_id, "element": element, "ref": ref,
+         "text": text, "submit": submit},
+        task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_hover(session_id: str, element: str, ref: str, task_id: str = "") -> Any:
+    """Hover over an element to reveal tooltips or dropdowns."""
+    result = await hover_tool.execute(
+        {"session_id": session_id, "element": element, "ref": ref},
+        task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_select_option(
+    session_id: str, element: str, ref: str, values: list[str], task_id: str = "",
+) -> Any:
+    """Select option(s) in a <select> dropdown."""
+    result = await select_option_tool.execute(
+        {"session_id": session_id, "element": element, "ref": ref, "values": values},
+        task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_press_key(session_id: str, key: str, task_id: str = "") -> Any:
+    """Press a keyboard key (Enter, Escape, ArrowDown, PageDown, etc.)."""
+    result = await press_key_tool.execute(
+        {"session_id": session_id, "key": key},
+        task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_go_back(session_id: str, task_id: str = "") -> Any:
+    """Go back in browser history."""
+    result = await go_back_tool.execute(
+        {"session_id": session_id}, task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_go_forward(session_id: str, task_id: str = "") -> Any:
+    """Go forward in browser history."""
+    result = await go_forward_tool.execute(
+        {"session_id": session_id}, task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_tab_new(session_id: str, url: str = "", task_id: str = "") -> Any:
+    """Open a new browser tab, optionally at a URL (subject to URL policy)."""
+    result = await tab_new_tool.execute(
+        {"session_id": session_id, "url": url} if url else {"session_id": session_id},
+        task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_tab_list(session_id: str, task_id: str = "") -> Any:
+    """List all open tabs with titles and URLs."""
+    result = await tab_list_tool.execute(
+        {"session_id": session_id}, task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_tab_select(session_id: str, index: int, task_id: str = "") -> Any:
+    """Switch to a tab by its index (from browser_tab_list)."""
+    result = await tab_select_tool.execute(
+        {"session_id": session_id, "index": index},
+        task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_tab_close(session_id: str, task_id: str = "") -> Any:
+    """Close the current browser tab."""
+    result = await tab_close_tool.execute(
+        {"session_id": session_id}, task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_take_screenshot(session_id: str, task_id: str = "") -> Any:
+    """Take a screenshot of the current page."""
+    result = await take_screenshot_tool.execute(
+        {"session_id": session_id}, task_id=resolve_task_id(task_id),
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_handle_dialog(
+    session_id: str, accept: bool, promptText: str = "", task_id: str = "",
+) -> Any:
+    """Accept or dismiss a browser dialog (alert, confirm, prompt)."""
+    args: dict[str, Any] = {"session_id": session_id, "accept": accept}
+    if promptText:
+        args["promptText"] = promptText
+    result = await handle_dialog_tool.execute(args, task_id=resolve_task_id(task_id))
+    return _payload(result)
+
+
+@mcp.tool()
+async def browser_drag(
+    session_id: str, startElement: str, startRef: str,
+    endElement: str, endRef: str, task_id: str = "",
+) -> Any:
+    """Drag one element to another."""
+    result = await drag_tool.execute(
+        {"session_id": session_id, "startElement": startElement, "startRef": startRef,
+         "endElement": endElement, "endRef": endRef},
         task_id=resolve_task_id(task_id),
     )
     return _payload(result)

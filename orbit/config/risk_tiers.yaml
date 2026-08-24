@@ -23,6 +23,20 @@ low:
   - browser_navigate       # navigates an open session; scheme/blocklist policy is enforced inside the tool itself
   - browser_snapshot       # read-only accessibility snapshot of the current page
   - browser_close          # closes a session and frees its resources; no side effects beyond that
+  - browser_click          # clicks an element identified by ref from browser_snapshot; scoped to the browser sandbox
+  - browser_type           # types into an input field; scoped to browser sandbox
+  - browser_hover          # hovers over an element; purely observational effect
+  - browser_select_option  # selects option(s) in a dropdown; scoped to browser sandbox
+  - browser_press_key      # presses a keyboard key in the browser context (PageDown for scrolling, etc.)
+  - browser_go_back        # navigates back in browser history
+  - browser_go_forward     # navigates forward in browser history
+  - browser_tab_new        # opens a new tab; URL policy enforced inside the tool if a URL is provided
+  - browser_tab_list       # lists open tabs; read-only, titles wrapped as untrusted
+  - browser_tab_select     # switches to a tab by index; no destructive effect
+  - browser_tab_close      # closes the current tab
+  - browser_take_screenshot # takes a screenshot of the current page; read-only
+  - browser_handle_dialog  # accepts/dismisses browser dialogs (alerts, confirms, prompts)
+  - browser_drag           # drags one element to another; scoped to browser sandbox
   - memory_search_tasks    # read-only FTS query over past tasks
   - memory_get_context     # read-only assembly of past memory content into a context block
   - memory_get_policy      # read-only config lookup (chrome_profiles.yaml)
@@ -34,6 +48,7 @@ low:
   - windows_get_foreground_window  # read-only: handle/title/process of whatever holds OS focus
   - windows_wait                   # polls for a window/process condition; no input simulated
   - windows_scroll                 # foreground-lane but not a click/keystroke — scrolling is the tool catalog's own low-tier framing for this one
+  - windows_clipboard_copy_image   # writes an image to the OS clipboard; local, reversible, no actuation
   - email_search           # read-only keyword search against the resolved backend (today: LocalMailBackend, a local stand-in — see communication_backend.py)
   - email_read             # read-only; wraps the body in <untrusted_email_content> markers inside the tool itself
   - email_list_threads     # read-only, no bodies returned
@@ -44,6 +59,8 @@ low:
   - perception_vision_locate          # read-only: screenshots a window and asks a vision model where something is; returns coordinates only, and its ElementRef is refused by windows-control's confidence gate
   - perception_capture_screenshot     # read-only: a screen/region capture, nothing is written to disk or actuated
   - perception_wait_for_visual_change # read-only: polls for a pixel diff, no input simulated
+  - list_files             # Dev-MCP: read-only directory listing, any folder on the machine
+  - read_file              # Dev-MCP: read-only file content (txt/py/pdf/docx/xlsx/pptx/images)
 
 medium:
   # Matches Section 7's medium examples: "Move/edit files, run scripts,
@@ -62,6 +79,8 @@ medium:
   - windows_open_app  # arbitrary code execution (launches a real process) — deliberately NOT elevated to 'high' or allowlisted; explicit design decision to follow the tool catalog's plain medium-tier assignment with no extra restriction
   - email_draft            # creates a draft against the resolved backend; drafting alone has no external effect since email_send is blocked
   - calendar_create_event  # generally reversible (cancelable) but can notify other people immediately — a step above pure-read per the tool catalog, even though it isn't email-send-level irreversible
+  - write_file             # Dev-MCP: writes to allowed paths only (Desktop/MCP, Downloads); server-side path restriction
+  - run_command            # Dev-MCP: sandboxed PowerShell execution; server-side command allowlist (git, python, pip, etc.)
 
 high:
   # fs_delete: quarantines rather than destroys (moves to filesystem_policy.yaml's

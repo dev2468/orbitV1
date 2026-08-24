@@ -173,14 +173,14 @@ async def test_agent_only_reaches_registered_policy_tools():
     assert declared, "expected a non-empty declared tool surface"
     assert declared <= registry, f"exposed but unregistered: {declared - registry}"
 
-    # 2. Raw-Playwright-only tool names — the full raw surface confirmed
-    # earlier this session by listing Playwright MCP's actual tools — must
-    # never be reachable, whatever the declared filter says.
+    # 2. Raw-Playwright-only tool names that have NO proxy implementation
+    # in browser_policy_tools.py — must never be reachable.  Tools we
+    # intentionally proxy (click, type, hover, etc.) are excluded: they
+    # exist in both raw Playwright AND our policy proxy, so their presence
+    # in the declared set is correct.
     raw_playwright_only = {
-        "browser_evaluate", "browser_take_screenshot", "browser_file_upload",
-        "browser_click", "browser_type", "browser_drag", "browser_hover",
-        "browser_press_key", "browser_select_option", "browser_tabs",
-        "browser_wait_for", "browser_console_messages", "browser_handle_dialog",
+        "browser_evaluate", "browser_file_upload",
+        "browser_tabs", "browser_wait_for", "browser_console_messages",
         "browser_run_code_unsafe", "browser_resize", "browser_drop",
         "browser_find", "browser_fill_form", "browser_navigate_back",
         "browser_network_requests", "browser_network_request",

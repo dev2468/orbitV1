@@ -1,36 +1,28 @@
-# gui/ — PySide6 dashboard
+# gui/ — PySide6 unified dashboard
 
-One file, `main.py`, ~96 lines. A `QMainWindow` holding a `QTableWidget` of tasks.
+One file, `main.py`. White background, blue accents, Fusion style. Four panels: goal input with lane
+selector, live output, task history table, and the confirmation channel.
 
-## It is read-only, and that is a design property
+## Task submission spawns a subprocess, not an in-process call
 
-Per the architecture spec's Section 3 the dashboard is a "window into runtime state only". It does
-not drive the agent, submit tasks, cancel them, or write to the database. It calls `db.init_db()`
-and `db.list_tasks()` on a 2s `QTimer` and repaints. That is the whole program.
+The "Send" button spawns `venv\Scripts\python.exe -m orbit.run_task [--foreground] <goal>` via
+`QProcess`. Stdout/stderr are merged and streamed into the live output panel. "Stop" kills the
+process. This respects the standing rule: **do not write task/event rows to `orbit.db` from this
+process.** `TaskManager` owns the in-memory task/token registry; a direct write would desync.
 
-The refresh loop exists because tasks are normally started from a *different process* —
-`orbit.run_task` (one-shot or its REPL) or `eval.run_eval` — so the dashboard has no in-process
-signal to react to and polls the shared SQLite file instead. The table is also
-`setEditTriggers(NoEditTriggers)`: cells cannot be edited into the DB.
+The one exception remains `ConfirmationPanel`, which writes to `pending_confirmations` only — see
+below.
 
-**If you add a control here, do not write to `orbit.db` from this process.** Cancellation and
-submission belong to `TaskManager`, which owns the in-memory task/token registry — a direct DB write
-would change a row's status without touching the running coroutine, leaving the two out of sync.
-Any control path has to reach the owning process, which does not exist yet.
-
-## The confirmation channel, now built
+## The confirmation channel
 
 `ConfirmationPanel` renders the oldest row in `pending_confirmations` — its stored screenshot with
-the candidate box drawn over it — and offers Approve / Reject. This is the piece this file used to
-say was missing, and it is here for the stated reason: the whole point is that **a human saw the
-actual action**.
+the candidate box drawn over it — and offers Approve / Reject.
 
-**Why writing to the DB is allowed here, when cancellation still is not.** The rule above stands:
-task status is owned by `TaskManager`'s in-memory registry, so a direct write would desync the two.
-`pending_confirmations` has no in-memory owner — the waiting process is *polling that table* for an
-answer, so the table IS the channel, exactly like the task list is the channel for display. The
-buttons call `db.resolve_pending_confirmation` and **nothing else**: no task rows, no event rows, no
-status changes. That restriction is what keeps this safe, so do not widen it.
+**Why writing to the DB is allowed here, when task submission is not.** Task status is owned by
+`TaskManager`'s in-memory registry, so a direct write would desync the two. `pending_confirmations`
+has no in-memory owner — the waiting process is *polling that table* for an answer, so the table IS
+the channel. The buttons call `db.resolve_pending_confirmation` and **nothing else**: no task rows,
+no event rows, no status changes. That restriction is what keeps this safe, so do not widen it.
 
 Approving mints a short-lived single-use token (`approval_token_ttl_seconds`). It does **not** raise
 the target's confidence or lower `min_actuation_confidence` — a second click needs a second yes.
@@ -61,7 +53,8 @@ when there is time to build the bridge, not as a drive-by.
 
 ## Columns
 
-`COLUMNS` drives both the header and the per-row lookup via `task.get(key)`, so adding a column is a
-one-line change *provided* the name matches a `tasks` table column exactly. A typo yields a silently
-empty column rather than an error. `failure_reason` is deliberately shown — a failed task must
-surface its plain-language reason, not just a red status.
+`TASK_COLUMNS` is a list of `(header, db_key)` tuples. Adding a column is a one-line append provided
+the db_key matches a `tasks` table column exactly. A typo yields a silently empty column rather than
+an error. `failure_reason` is deliberately shown — a failed task must surface its plain-language
+reason, not just a red status. `task_id` is deliberately hidden from the table (it's noise for the
+user) but still readable via the DB.

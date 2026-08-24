@@ -1,6 +1,6 @@
 # tests/ — philosophy, fixtures, and the real-DB trap
 
-279 tests across sixteen files (278 collected into the default run + 1 opt-in). The vision work added
+286 tests across sixteen files (285 collected into the default run + 1 opt-in). The vision work added
 five: `test_grounding_bench.py` (the benchmark's deterministic half), `test_candidate_source.py`
 (candidate generation), `test_set_of_mark.py` (set-of-mark grounding), and
 `test_pending_confirmations.py` (the approval data model) and `test_confirmation_flow.py` (the REPL/GUI approval channel, with the

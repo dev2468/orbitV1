@@ -2,15 +2,15 @@
 the MCP tool layer doc. A thin policy-enforcing PROXY in front of
 Playwright MCP; does not reimplement browser automation.
 
-Scope note (honest, not hidden): browser_click/browser_type from the
-prompt are NOT implemented in this pass — they're mechanically similar to
-navigate/snapshot proxying (same session lookup, same mid-action-URL
-re-check) but add real testing surface, and this session's priority was
-getting open/navigate/snapshot/extract solid and leak-free rather than
-covering every tool shallowly. browser_extract's `schema` parameter is
-also simplified to a JS expression evaluated in-page (via the underlying
-browser_evaluate primitive) rather than full schema-guided extraction —
-real schema-guided extraction is future work.
+Full interaction surface: click, type, hover, select, press_key, drag,
+tab management (new/list/select/close), navigation history
+(back/forward), screenshot, and dialog handling — all proxied through the
+same session lookup + idle-touch pattern as navigate/snapshot.
+
+browser_extract's `schema` parameter is simplified to a JS expression
+evaluated in-page (via the underlying browser_evaluate primitive) rather
+than full schema-guided extraction — real schema-guided extraction is
+future work.
 
 Session lifecycle: each browser_open spawns its own Playwright MCP
 subprocess bound to a resolved profile's --user-data-dir, tracked via an
@@ -479,5 +479,218 @@ extract_tool = ExtractTool(
         "page text — smaller context, smaller injection surface. Returned "
         "content is wrapped as untrusted.",
         returns_untrusted_content=True,
+    )
+)
+
+
+# -- Interaction / tab / navigation proxy tools ----------------------------
+#
+# Each forwards to the identically-named Playwright MCP tool through an
+# existing session.  The pattern is always: look up session, touch the idle
+# timer, call_tool, return the text result.
+
+
+async def _proxy_simple(
+    session_id: str, tool_name: str, params: dict
+) -> tuple[Any, Optional[float]]:
+    """Forward a call to Playwright MCP via an existing session."""
+    sess = _get_session(session_id)
+    _touch(sess)
+    result = await sess.mcp_session.call_tool(tool_name, params)
+    text = result.content[0].text if result.content else ""
+    return text, Confidence.API_SUCCESS
+
+
+class ClickTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        params: dict[str, Any] = {"element": args["element"], "ref": args["ref"]}
+        return await _proxy_simple(args["session_id"], "browser_click", params)
+
+
+class BrowserTypeTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        params: dict[str, Any] = {
+            "element": args["element"],
+            "ref": args["ref"],
+            "text": args["text"],
+        }
+        if args.get("submit") is not None:
+            params["submit"] = args["submit"]
+        return await _proxy_simple(args["session_id"], "browser_type", params)
+
+
+class HoverTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        return await _proxy_simple(
+            args["session_id"], "browser_hover",
+            {"element": args["element"], "ref": args["ref"]},
+        )
+
+
+class SelectOptionTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        params: dict[str, Any] = {
+            "element": args["element"],
+            "ref": args["ref"],
+            "values": args["values"],
+        }
+        return await _proxy_simple(args["session_id"], "browser_select_option", params)
+
+
+class PressKeyTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        return await _proxy_simple(
+            args["session_id"], "browser_press_key", {"key": args["key"]},
+        )
+
+
+class GoBackTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        return await _proxy_simple(args["session_id"], "browser_go_back", {})
+
+
+class GoForwardTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        return await _proxy_simple(args["session_id"], "browser_go_forward", {})
+
+
+class TabNewTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        params: dict[str, Any] = {}
+        if args.get("url"):
+            _check_url_policy(args["url"])
+            params["url"] = args["url"]
+        return await _proxy_simple(args["session_id"], "browser_tab_new", params)
+
+
+class TabListTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        sess = _get_session(args["session_id"])
+        _touch(sess)
+        result = await sess.mcp_session.call_tool("browser_tab_list", {})
+        text = result.content[0].text if result.content else ""
+        return _wrap_untrusted(text, sess.approved_url), Confidence.API_SUCCESS
+
+
+class TabSelectTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        return await _proxy_simple(
+            args["session_id"], "browser_tab_select", {"index": args["index"]},
+        )
+
+
+class TabCloseTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        return await _proxy_simple(args["session_id"], "browser_tab_close", {})
+
+
+class TakeScreenshotTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        import base64
+
+        sess = _get_session(args["session_id"])
+        _touch(sess)
+        result = await sess.mcp_session.call_tool("browser_take_screenshot", {})
+        if not result.content:
+            return "no screenshot captured", Confidence.API_SUCCESS
+
+        content = result.content[0]
+        if hasattr(content, "data") and content.data:
+            screenshots_dir = _PROJECT_ROOT / "data" / "fs_workspace" / "screenshots"
+            screenshots_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"screenshot_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
+            filepath = screenshots_dir / filename
+            filepath.write_bytes(base64.b64decode(content.data))
+            return {"screenshot_path": str(filepath)}, Confidence.API_SUCCESS
+
+        text = content.text if hasattr(content, "text") else ""
+        return text, Confidence.API_SUCCESS
+
+
+class HandleDialogTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        params: dict[str, Any] = {"accept": args["accept"]}
+        if args.get("promptText"):
+            params["promptText"] = args["promptText"]
+        return await _proxy_simple(args["session_id"], "browser_handle_dialog", params)
+
+
+class DragTool(BaseTool):
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        return await _proxy_simple(
+            args["session_id"], "browser_drag",
+            {k: args[k] for k in ("startElement", "startRef", "endElement", "endRef")},
+        )
+
+
+# -- instances -------------------------------------------------------------
+
+click_tool = ClickTool(
+    _metadata("browser_click", "Click an element on the page. Pass the element description and its ref from browser_snapshot.")
+)
+browser_type_tool = BrowserTypeTool(
+    _metadata(
+        "browser_type",
+        "Type text into an input field. Pass the element description, its ref, "
+        "and the text. Set submit=true to press Enter after typing.",
+    )
+)
+hover_tool = HoverTool(
+    _metadata("browser_hover", "Hover over an element to reveal tooltips or dropdown menus.")
+)
+select_option_tool = SelectOptionTool(
+    _metadata(
+        "browser_select_option",
+        "Select one or more options in a <select> dropdown. Pass values as a list of option texts.",
+    )
+)
+press_key_tool = PressKeyTool(
+    _metadata(
+        "browser_press_key",
+        "Press a keyboard key (e.g. 'Enter', 'Escape', 'ArrowDown', 'PageDown'). "
+        "Use PageDown/PageUp to scroll the page.",
+    )
+)
+go_back_tool = GoBackTool(
+    _metadata("browser_go_back", "Go back in browser history (like clicking the back button).")
+)
+go_forward_tool = GoForwardTool(
+    _metadata("browser_go_forward", "Go forward in browser history.")
+)
+tab_new_tool = TabNewTool(
+    _metadata(
+        "browser_tab_new",
+        "Open a new browser tab, optionally navigating to a URL. "
+        "URL policy is enforced if a URL is provided.",
+    )
+)
+tab_list_tool = TabListTool(
+    _metadata(
+        "browser_tab_list",
+        "List all open browser tabs with their titles and URLs. "
+        "Titles are wrapped as untrusted web content.",
+        returns_untrusted_content=True,
+    )
+)
+tab_select_tool = TabSelectTool(
+    _metadata("browser_tab_select", "Switch to a tab by its index (from browser_tab_list).")
+)
+tab_close_tool = TabCloseTool(
+    _metadata("browser_tab_close", "Close the current browser tab.")
+)
+take_screenshot_tool = TakeScreenshotTool(
+    _metadata("browser_take_screenshot", "Take a screenshot of the current page as an image.")
+)
+handle_dialog_tool = HandleDialogTool(
+    _metadata(
+        "browser_handle_dialog",
+        "Accept or dismiss a browser dialog (alert, confirm, prompt). "
+        "Pass promptText for prompt dialogs.",
+    )
+)
+drag_tool = DragTool(
+    _metadata(
+        "browser_drag",
+        "Drag one element to another. Pass start and end element descriptions and refs.",
     )
 )

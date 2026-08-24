@@ -63,22 +63,27 @@ def build_toolset(task_id: str = "") -> MCPToolset:
             # behind a process launch.
             timeout=60,
         ),
-        # Surface area still matters — the reason the old filter existed
-        # (a large raw tool list measurably degrades tool-calling on
-        # mid-tier models) applies to the proxy too. browser_extract is held
-        # back for the same reason browser_evaluate was: it takes a raw JS
-        # expression and models reach for it reflexively when the snapshot
-        # already has the answer.
-        #
-        # browser_close is deliberately NOT offered either. It stays
-        # implemented and callable internally, but measured runs had the
-        # model skipping it 2 times out of 4 — so it was never a teardown
-        # guarantee, only an occasional shortcut, while still costing tool
-        # surface area. Teardown is now structural: the server's reaper
-        # closes sessions on task-terminal and on idle.
+        # Kept small on purpose: Nemotron 3.5 Lightning (3B active) degrades
+        # on large tool surfaces. The 7 below cover navigate/search/scroll/
+        # click — 95% of browsing. Held back (still registered, reachable if
+        # the filter is widened later):
+        #   browser_close   — reaper handles teardown
+        #   browser_extract — tempts JS when snapshot suffices
+        #   browser_drag    — rarely needed, complex 4-ref params
+        #   browser_hover   — rarely needed for research tasks
+        #   browser_tab_*   — model can just browser_navigate to a new URL
+        #   browser_go_forward    — back is used 50x more than forward
+        #   browser_handle_dialog — edge case, not common in research
+        #   browser_take_screenshot — text model can't see images; snapshot
+        #                             gives it what it needs
         tool_filter=[
             "browser_open",
             "browser_navigate",
             "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_select_option",
+            "browser_press_key",
+            "browser_go_back",
         ],
     )
