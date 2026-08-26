@@ -30,22 +30,20 @@ the wrong interpreter or nothing at all.
 
 ## tool_filter: every name is there on purpose
 
-The original 3-tool browser filter (open/navigate/snapshot) was expanded with core interaction
-tools: click, type, select_option, press_key (for scrolling), and go_back. The filter is
-deliberately kept small — Nemotron 3.5 Lightning (3B active params) degrades on large tool surfaces,
-and the original spec already warned about this with Playwright MCP's full 24-tool surface.
+The filter was widened from 8 to 14 tools when the default model switched from Nemotron 3.5
+Lightning (3B active params, degraded on large tool surfaces) to Claude Sonnet 4, which handles
+50+ tools without reliability loss. The original 3-tool filter (open/navigate/snapshot) was expanded
+through two rounds: first to 8 (click, type, select_option, press_key, go_back), then to 14
+(hover, go_forward, tab_new/list/select, handle_dialog).
+
 Still held back:
 
 - **`browser_extract`**: takes a raw JS expression; models reach for it when snapshot suffices.
 - **`browser_close`**: teardown is the reaper's job (model skipped it 2/4 measured runs).
-- **`browser_take_screenshot`**: returns image data the text model can't process; use
-  `browser_snapshot` for text or `perception_capture_screenshot` for real screenshots.
+- **`browser_take_screenshot`**: returns image data; use `browser_snapshot` for text or
+  `perception_capture_screenshot` for real screenshots.
 - **`browser_drag`**: rarely needed, complex 4-ref params.
-- **`browser_hover`**: rarely needed for research tasks.
-- **`browser_tab_new/list/select/close`**: the model can just `browser_navigate` to a new URL;
-  tab management adds 4 tools for minimal benefit on a small model.
-- **`browser_go_forward`**: back is used far more than forward.
-- **`browser_handle_dialog`**: edge case, not common in research.
+- **`browser_tab_close`**: model can just navigate away; closing tabs adds little value.
 - **`memory_get_task`**: mainly useful once the model already has a task_id in hand.
 
 Exposed today: `browser_open`, `browser_navigate`, `browser_snapshot`, `browser_click`,

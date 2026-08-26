@@ -194,6 +194,8 @@ def _wrap_untrusted(text: str, source: Optional[str]) -> str:
 
 
 class OpenSessionTool(BaseTool):
+    default_timeout_s = 90.0
+
     async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
         context = args["context"]
         profiles = load_chrome_profiles()

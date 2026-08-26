@@ -347,10 +347,11 @@ def test_waiting_times_out_rather_than_blocking_forever(task_id):
     assert db.get_pending_confirmation(cid)["status"] == "PENDING"
 
 
-def test_the_gui_channel_is_off_by_default():
-    """A non-zero wait makes every unattended run block on each confirmation
-    before failing closed. Opt in deliberately."""
-    assert confirmation._gui_wait_seconds() == 0
+def test_the_gui_channel_is_enabled_for_interactive_use():
+    """The GUI approval channel is enabled (30s) so a human watching the
+    dashboard can approve below-floor vision-tier clicks. Set back to 0
+    for unattended runs (eval, CI)."""
+    assert confirmation._gui_wait_seconds() == 30
 
 
 # --- Phase 6: provider keys -------------------------------------------------

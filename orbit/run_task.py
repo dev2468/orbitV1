@@ -13,7 +13,7 @@ from typing import Any
 from google.adk.runners import InMemoryRunner
 
 from orbit import db
-from orbit.agent import build_agent
+from orbit.agent import build_agent, validate_model_key
 from orbit.degradation import graceful_degradation_message
 from orbit.policy import SafetyPlugin
 from orbit.task_manager import TaskManager
@@ -32,6 +32,7 @@ def _extract_final_text(events: list) -> str:
 async def run_task(
     title: str, goal: str, *, lane: str = "headless", risk_tier: str = "low"
 ) -> dict[str, Any]:
+    validate_model_key()
     db.init_db()
     tm = TaskManager()
     task_id = db.create_task(title, goal=goal, lane=lane, risk_tier=risk_tier)

@@ -63,27 +63,30 @@ def build_toolset(task_id: str = "") -> MCPToolset:
             # behind a process launch.
             timeout=60,
         ),
-        # Kept small on purpose: Nemotron 3.5 Lightning (3B active) degrades
-        # on large tool surfaces. The 7 below cover navigate/search/scroll/
-        # click — 95% of browsing. Held back (still registered, reachable if
-        # the filter is widened later):
+        # Claude handles a larger tool surface without degradation (unlike
+        # Nemotron 3.5 Lightning's 3B active params, which needed 8 tools
+        # max). The 14 below cover full browsing: navigate, interact, scroll,
+        # multi-tab research, and dialog handling.
+        # Still held back:
         #   browser_close   — reaper handles teardown
         #   browser_extract — tempts JS when snapshot suffices
         #   browser_drag    — rarely needed, complex 4-ref params
-        #   browser_hover   — rarely needed for research tasks
-        #   browser_tab_*   — model can just browser_navigate to a new URL
-        #   browser_go_forward    — back is used 50x more than forward
-        #   browser_handle_dialog — edge case, not common in research
-        #   browser_take_screenshot — text model can't see images; snapshot
-        #                             gives it what it needs
+        #   browser_take_screenshot — snapshot gives text content; use
+        #                             perception_capture_screenshot for images
         tool_filter=[
             "browser_open",
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
             "browser_type",
+            "browser_hover",
             "browser_select_option",
             "browser_press_key",
             "browser_go_back",
+            "browser_go_forward",
+            "browser_tab_new",
+            "browser_tab_list",
+            "browser_tab_select",
+            "browser_handle_dialog",
         ],
     )
