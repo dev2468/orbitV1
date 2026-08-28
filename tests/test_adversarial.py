@@ -62,17 +62,12 @@ from orbit.task_manager import TaskManager
 
 @pytest.fixture(autouse=True)
 def _ensure_model_key(monkeypatch):
-    """These tests make real LLM calls. If the default model's key is
-    missing (e.g. ANTHROPIC_API_KEY not set yet), fall back to Nemotron
-    which has a valid NVIDIA_NIM_API_KEY in .env."""
+    """These tests make real LLM calls. Ensure OPENROUTER_API_KEY is set."""
     import os
     from orbit.agent import DEFAULT_MODEL, _REQUIRED_KEY_BY_PREFIX
     for prefix, key in _REQUIRED_KEY_BY_PREFIX.items():
         if DEFAULT_MODEL.startswith(prefix) and not os.environ.get(key):
-            monkeypatch.setenv(
-                "ORBIT_MODEL",
-                "nvidia_nim/nvidia/nemotron-3.5-lightning-30b-a3b",
-            )
+            pytest.skip(f"{key} not set — cannot run live LLM tests")
             break
 
 

@@ -38,9 +38,11 @@ check between awaits, and a hard cancel alone can land in the middle of an actio
 `CancellationToken` is defined here and reused by `orbit/tools/foundation.py` on purpose — one
 cancellation story for the whole system, not two that drift.
 
-## SafetyPlugin's three callbacks (`policy.py`)
+## SafetyPlugin's four callbacks (`policy.py`)
 
-Which failures land in which is the thing people get wrong:
+Three route failures; the fourth (`before_model_callback`) is not about failure at all — it is the
+context-cost hook, described in its own section below. Which failures land in which of the other
+three is the thing people get wrong:
 
 - **`before_tool_callback`** — cancellation check, then the registry hard block, then the tier
   check. The registry check runs *ahead of and separately from* tier logic: an uncatalogued tool
@@ -75,6 +77,47 @@ the transport bucket, and 5xx requires a precise `\b5\d{2}\b` match. It used to 
 checked first, so "element 5 not found" classified as `tool_failure` (blind retry) instead of
 `state_failure` (re-observe). Between HTTP codes, element indexes and timestamps that was a large
 share of real errors in the wrong bucket.
+
+## Context cost: `before_model_callback` and the cache breakpoint
+
+Two mechanisms, in two different files, both aimed at the same fact: **an LLM API is stateless.**
+Every turn re-sends the system instruction, every tool schema, and the entire conversation. A large
+tool result is therefore not billed once — it is billed again on every remaining turn of the task.
+Measured from this build's own event log: `browser_snapshot` averaged 76,811 characters per call
+with a worst case of 621,442 (~155,000 tokens), and accounted for 12.0M of 13.8M total result
+characters ever produced.
+
+**`SafetyPlugin.before_model_callback` compacts history.** It replaces `function_response` payloads
+that are both stale (older than `keep_full_results`, default 3) and large (over
+`stale_result_char_limit`, default 2000) with an explicit note naming the tool and the size. It
+touches *only* function responses — never user text, never model reasoning, never tool **arguments**
+(small, and the record of what was already tried, so dropping them invites repetition). The note is
+deliberate: a model that can see something was elided re-calls the tool, whereas one shown an
+unexplained gap confabulates over it. It never raises — a context optimisation must not fail a task.
+
+**`orbit/agent.py`'s `_CachingLiteLLMClient` marks a prompt-cache breakpoint.** Gemini honours only
+the last breakpoint, so one marker on the final message caches everything before it. Read that
+function's docstring before touching it: three more obvious routes (ADK's `LlmRequest.cache_config`,
+injecting from `before_model_callback`, and litellm's `cache_control_injection_points` kwarg) are all
+**silently inert** on the installed versions — the kwarg does not exist in litellm 1.96.0 at all.
+The one working route was confirmed by intercepting the outgoing HTTP body, not from docs.
+
+**They do not stack cleanly, and that is expected.** Caching pays only on a byte-identical prefix,
+and eliding a result rewrites the middle of the history. Turns where a new elision happens take a
+cache miss; the rest hit. The trade still favours compaction — dropping a 155,000-token payload beats
+paying 0.25x to keep re-sending it. Compaction runs first (ADK-side), caching marks the compacted
+result, which is the correct order.
+
+Payload caps live at the MCP edge rather than here — `url_policy.yaml`'s `max_content_chars` for
+browser content, and `perception_server.py`'s node pruning and screenshot-to-disk. See
+`orbit/mcp_servers/CLAUDE.md`. `tests/test_llm_cost.py` pins all of it, because every one of these
+fails silently: the task still succeeds and the only symptom is a larger bill.
+
+**Sessions are already isolated per task.** `run_task()` builds a fresh `InMemoryRunner` and a new
+session keyed by `task_id` for every goal, including each line typed at the REPL — so conversation
+history never carries from one task into the next. Adding "chat sessions" would not reduce tokens;
+the cost is entirely *within* a single task's turn loop, which is what the two mechanisms above
+address.
 
 ## The adhoc- task row and the foreign key that forces it
 

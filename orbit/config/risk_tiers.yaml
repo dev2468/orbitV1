@@ -59,6 +59,7 @@ low:
   - perception_vision_locate          # read-only: screenshots a window and asks a vision model where something is; returns coordinates only, and its ElementRef is refused by windows-control's confidence gate
   - perception_capture_screenshot     # read-only: a screen/region capture, nothing is written to disk or actuated
   - perception_wait_for_visual_change # read-only: polls for a pixel diff, no input simulated
+  - ui_memory_lookup  # read-only: returns cached {x, y} for a (process, desc) pair from the ui_memory table
   - list_files             # Dev-MCP: read-only directory listing, any folder on the machine
   - read_file              # Dev-MCP: read-only file content (txt/py/pdf/docx/xlsx/pptx/images)
 
@@ -77,10 +78,12 @@ medium:
   - windows_type      # real keystroke simulation (via clipboard paste); optionally focuses a target first under the same confidence gate as windows_click
   - windows_key       # real keystroke simulation; self-refuses a small denylist of destructive/system combos (Alt+F4, Ctrl+Alt+Delete, Win+L) regardless of tier
   - windows_open_app  # arbitrary code execution (launches a real process) — deliberately NOT elevated to 'high' or allowlisted; explicit design decision to follow the tool catalog's plain medium-tier assignment with no extra restriction
+  - windows_batch_actions  # meta-tool: chains click/type/key/scroll/open_app/wait sequentially; each sub-action enforces the same confidence gate, blocked-combo denylist, and policy checks as the standalone tool
   - email_draft            # creates a draft against the resolved backend; drafting alone has no external effect since email_send is blocked
   - calendar_create_event  # generally reversible (cancelable) but can notify other people immediately — a step above pure-read per the tool catalog, even though it isn't email-send-level irreversible
   - write_file             # Dev-MCP: writes to allowed paths only (Desktop/MCP, Downloads); server-side path restriction
   - run_command            # Dev-MCP: sandboxed PowerShell execution; server-side command allowlist (git, python, pip, etc.)
+  - ui_memory_upsert       # local SQLite write to ui_memory table; no external effect, no destruction, append-style upsert
 
 high:
   # fs_delete: quarantines rather than destroys (moves to filesystem_policy.yaml's

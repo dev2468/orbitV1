@@ -236,6 +236,8 @@ class SafetyPlugin(BasePlugin):
         default_tier: RiskTier = "medium",
         retry_cap: int = 2,
         name: str = "orbit_safety",
+        keep_full_results: int = 3,
+        stale_result_char_limit: int = 2000,
     ) -> None:
         super().__init__(name)
         self.task_manager = task_manager
@@ -244,9 +246,88 @@ class SafetyPlugin(BasePlugin):
         self.default_tier = default_tier
         self.retry_cap = retry_cap
         self._consecutive_failures: dict[tuple[str, str], int] = {}
+        self.keep_full_results = keep_full_results
+        self.stale_result_char_limit = stale_result_char_limit
 
     def _tier_for(self, tool_name: str) -> RiskTier:
         return self.risk_tiers.get(tool_name, self.default_tier)
+
+    async def before_model_callback(self, *, callback_context, llm_request):
+        """Compact stale bulk out of the conversation before it is re-sent.
+
+        An LLM API is stateless: every turn re-sends the whole conversation,
+        so a large tool result is not billed once but on every remaining turn
+        of the task. A 40-turn task that read three big pages early pays for
+        those three pages roughly 37 more times.
+
+        What this drops is narrow on purpose. Only `function_response`
+        payloads are touched — never user text, never the model's own
+        reasoning, never a tool's ARGUMENTS (which are small and are the
+        record of what was already tried, so dropping them invites the model
+        to repeat itself). The most recent `keep_full_results` results are
+        always left intact, because those are what the model is actively
+        reasoning about; only older ones over `stale_result_char_limit` are
+        replaced.
+
+        The replacement is an explicit note naming the tool and the size,
+        not a silent deletion. That distinction is the whole design: a model
+        that can see something was elided will re-call the tool when it
+        genuinely needs the detail, whereas a model shown a gap it cannot
+        account for tends to confabulate over it.
+
+        INTERACTION WITH PROMPT CACHING (orbit/agent.py's cache breakpoint):
+        these two do not stack cleanly, and it is worth knowing why rather
+        than assuming they multiply. Caching pays off only when the prefix is
+        byte-identical to the previous turn; eliding a result rewrites the
+        middle of the history and invalidates the cache from that point. In
+        practice a new elision happens on only some turns — most tool results
+        never cross the size limit — so those turns take a cache miss and the
+        rest still hit. The trade is worth it either way: removing a 155,000-
+        token payload outright beats paying 0.25x to keep re-sending it.
+        Compaction runs first (here, ADK-side) and caching marks the already-
+        compacted history, which is the correct order.
+
+        Returning None always — this mutates the request and never
+        short-circuits the model call.
+        """
+        try:
+            self._compact_history(llm_request)
+        except Exception:  # noqa: BLE001
+            # A context optimisation must never be able to fail a task.
+            logger.debug("history compaction skipped", exc_info=True)
+        return None
+
+    def _compact_history(self, llm_request: Any) -> None:
+        contents = getattr(llm_request, "contents", None) or []
+
+        # Walk newest-first so "the last N results" is counted correctly,
+        # then stub anything older and oversized.
+        seen = 0
+        for content in reversed(contents):
+            for part in reversed(getattr(content, "parts", None) or []):
+                fr = getattr(part, "function_response", None)
+                if fr is None:
+                    continue
+                seen += 1
+                if seen <= self.keep_full_results:
+                    continue
+                response = getattr(fr, "response", None)
+                if response is None:
+                    continue
+                try:
+                    size = len(json.dumps(response, default=str))
+                except (TypeError, ValueError):
+                    size = len(str(response))
+                if size <= self.stale_result_char_limit:
+                    continue
+                fr.response = {
+                    "elided": (
+                        f"This {getattr(fr, 'name', 'tool')} result "
+                        f"({size:,} characters) was removed from the "
+                        "conversation to save context. It succeeded at the "
+                        "time. Call the tool again if you still need it."
+                    )
+                }
 
     @staticmethod
     def _extract_structured_failure(result: Any) -> Optional[tuple[str, str]]:

@@ -189,7 +189,42 @@ def _parse_evaluate_result(text: str) -> dict:
         return {}
 
 
+def _load_max_content_chars() -> int:
+    raw = yaml.safe_load((_CONFIG_DIR / "url_policy.yaml").read_text()) or {}
+    return int(raw.get("max_content_chars", 12000))
+
+
 def _wrap_untrusted(text: str, source: Optional[str]) -> str:
+    """Wrap page content in untrusted markers, truncating past
+    url_policy.yaml's max_content_chars.
+
+    The truncation is here rather than in each tool for the same reason the
+    untrusted marker is: this is the one function every content-bearing
+    browser tool returns through, so a cap added here cannot be forgotten by
+    a tool author or bypassed by a new tool that copies an existing one.
+
+    Why a cap exists at all: an LLM API is stateless, so every tool result
+    stays in the conversation and is re-sent with every subsequent request
+    for the rest of the task. A single 621,442-char snapshot (measured in
+    this build's own event log — ~155,000 tokens) is therefore not billed
+    once, it is billed again on every remaining turn. Capping the input is
+    the only place that compounding can be stopped.
+
+    Truncation is announced in the returned text, never silent — a model
+    that believes it saw a whole page when it saw the first third will
+    confidently report a wrong answer, which is worse than a large payload.
+    """
+    limit = _load_max_content_chars()
+    if len(text) > limit:
+        omitted = len(text) - limit
+        text = (
+            text[:limit]
+            + f"\n\n[TRUNCATED: {omitted:,} more characters were omitted "
+            f"({len(text):,} total). You are seeing the first {limit:,} "
+            "characters only. Scroll with browser_press_key('PageDown') and "
+            "snapshot again to see later content, or navigate to a more "
+            "specific page — do NOT assume this is the whole page.]"
+        )
     return f'<untrusted_web_content source="{source or "unknown"}">\n{text}\n</untrusted_web_content>'
 
 

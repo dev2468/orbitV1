@@ -32,6 +32,26 @@ blocked_key_combos:
 # stop today, not a softer retry path.
 min_actuation_confidence: 0.70
 
+# Whether a raw {x, y} click has to be approved by a human before it lands.
+#
+# false here is a DELIBERATE operator choice, not an oversight. Vision-driven
+# desktop control is built out of coordinate clicks: the model takes a
+# screenshot, looks at it, and clicks what it sees, dozens of times in a
+# single task. Asking per click makes that mode unusable — the human ends up
+# rubber-stamping a prompt they have stopped reading, which is worse than no
+# prompt at all, because it looks like oversight and isn't.
+#
+# What this does NOT relax: an already-resolved ElementRef carrying a
+# below-floor `confidence` (e.g. straight out of perception_vision_locate)
+# still goes through the confirmation channel, and min_actuation_confidence
+# above still governs it. Only a bare {x, y} the model chose by looking at a
+# picture is covered here — the case where there is no resolver opinion to
+# check against in the first place.
+#
+# Set back to true for unattended or shared machines, where an unreviewed
+# click landing wherever focus happens to be is the bigger risk.
+confirm_raw_coordinate_clicks: false
+
 # How long a human approval stays usable, in seconds.
 #
 # Short on purpose. An approval is consent about a SCREENSHOT OF A MOMENT:

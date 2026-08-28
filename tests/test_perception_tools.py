@@ -391,7 +391,7 @@ def test_fit_for_inline_upload_leaves_a_small_image_untouched():
 def test_fit_for_inline_upload_downscales_only_when_over_the_documented_limit():
     """A 4x4 white image downscaled 2x is still a valid PNG, and the factor
     reported back is what the coordinate translation will reverse."""
-    huge = b"x" * (pt._NIM_MAX_INLINE_B64_CHARS + 10)
+    huge = b"x" * (pt._VISION_MAX_INLINE_B64_CHARS + 10)
     raw = bytes([255]) * (4 * 4 * 3)
     sent, factor = pt._fit_for_inline_upload(huge, raw, 4, 4)
     assert factor == 2
@@ -413,13 +413,18 @@ def test_box_downscale_averages_pixels_and_halves_dimensions():
 def test_vision_sourced_element_ref_is_still_refused_by_actuation():
     """THE test. A vision-tier ElementRef — exactly what
     perception_vision_locate returns — fed into windows-control's real
-    target resolver must still be refused by the confidence gate, the same
-    way a raw {x, y} always has been.
+    target resolver must still be refused by the confidence gate.
+
+    NOTE: raw {x, y} dicts now bypass the gate entirely (direct coordinate
+    clicks). This test covers a DIFFERENT path: an already-resolved ElementRef
+    with source='vision' and confidence=VISION_INFERRED, which arrives through
+    _resolve_click_target's first branch (has bounds/source/confidence keys).
+    That path still hits _require_confidence and must be refused.
 
     Asserted against the REAL windows_control_policy.yaml floor and the REAL
     _resolve_click_target, not a stand-in: the point is that no path exists
-    from this tool's output to a real mouse click, so a stubbed policy would
-    test nothing."""
+    from perception_vision_locate's output to a real mouse click without
+    the user explicitly supplying {x, y} coordinates themselves."""
     import orbit.mcp_servers.windows_control_tools as wc_tools
 
     vision_element = ElementRef(
@@ -427,7 +432,7 @@ def test_vision_sourced_element_ref_is_still_refused_by_actuation():
         role=None,
         name="the red record button",
         bounds=(280, 480, 320, 520),
-        state={"vision": {"model": "nvidia_nim/google/gemma-4-31b-it"}},
+        state={"vision": {"model": "openrouter/google/gemma-3-27b-it"}},
         source="vision",
         confidence=pt.Confidence.VISION_INFERRED,
     )

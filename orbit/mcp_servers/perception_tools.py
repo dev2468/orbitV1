@@ -299,15 +299,25 @@ class CaptureScreenshotTool(BaseTool):
     written to disk by this tool."""
 
     async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
-        png_bytes, monitor, _size = _grab_png(args.get("region"))
-        return (
-            {
-                "region": {"left": monitor["left"], "top": monitor["top"], "width": monitor["width"], "height": monitor["height"]},
-                "image_base64": base64.b64encode(png_bytes).decode("ascii"),
-                "format": "png",
-            },
-            Confidence.API_SUCCESS,
-        )
+        png_bytes, monitor, (w, h) = _grab_png(args.get("region"))
+        payload: dict = {
+            "region": {"left": monitor["left"], "top": monitor["top"], "width": monitor["width"], "height": monitor["height"]},
+            "image_base64": base64.b64encode(png_bytes).decode("ascii"),
+            "format": "png",
+        }
+        # Downscaled thumbnail so the orchestrating model can SEE the screen.
+        # Uses the existing pure-Python _box_downscale (no Pillow) + mss PNG
+        # encoder. Target ~400px wide; stays unscaled if already small enough.
+        if w >= 8 and h >= 8:
+            factor = max(1, w // 400)
+            try:
+                raw_rgb = _grab_raw_rgb(args.get("region"))
+                small_rgb, nw, nh = _box_downscale(raw_rgb, w, h, factor)
+                small_png = mss.tools.to_png(small_rgb, (nw, nh))
+                payload["image_small_b64"] = base64.b64encode(small_png).decode("ascii")
+            except Exception:
+                pass
+        return payload, Confidence.API_SUCCESS
 
 
 def _grab_png(region: Optional[dict]) -> tuple[bytes, dict, tuple[int, int]]:
@@ -450,11 +460,11 @@ def _region_to_monitor(region: Optional[dict], sct: "mss.base.MSSBase") -> dict:
 #   leaving it to whichever tool happened to run first.
 # ===========================================================================
 
-_VISION_MODEL = "nvidia_nim/google/gemma-4-31b-it"
+_VISION_MODEL = "openrouter/google/gemma-3-27b-it"
 
-# NVIDIA's documented inline-image ceiling for hosted NIM endpoints. Not a
-# number this codebase invented — see the IMAGE SIZE note above.
-_NIM_MAX_INLINE_B64_CHARS = 180_000
+# Inline-image ceiling. OpenRouter proxies to various providers; keeping
+# the conservative 180k-char limit avoids surprises across backends.
+_VISION_MAX_INLINE_B64_CHARS = 180_000
 
 # When the model returns a POINT rather than a box (which, per the spike, is
 # every time so far) there is no extent to report. A zero-area box would
@@ -592,8 +602,8 @@ def _ensure_physical_screen_coords() -> None:
         _dpi_ready = True
 
 
-def _nim_api_key() -> str:
-    """Read NVIDIA_NIM_API_KEY, loading the project .env if it is not set.
+def _openrouter_api_key() -> str:
+    """Read OPENROUTER_API_KEY, loading the project .env if it is not set.
 
     This matters here specifically: the MCP servers are spawned with
     env={"ORBIT_TASK_ID": ...} (orbit/skills/*.py), and mcp's
@@ -603,7 +613,7 @@ def _nim_api_key() -> str:
     no API key in its environment at all. The .env path is resolved from
     this file rather than the cwd, because the subprocess's working
     directory is not something this tool controls."""
-    key = os.environ.get("NVIDIA_NIM_API_KEY", "").strip()
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if key:
         return key
     try:
@@ -612,13 +622,12 @@ def _nim_api_key() -> str:
         load_dotenv(Path(__file__).resolve().parents[2] / ".env")
     except Exception:
         pass
-    key = os.environ.get("NVIDIA_NIM_API_KEY", "").strip()
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not key:
         raise ClassifiedToolError(
             "state_failure",
-            "NVIDIA_NIM_API_KEY is not set, so the vision tier cannot run. Add it to the "
-            ".env file in the project root — this is a second model string on the provider "
-            "the orchestrating model already uses, not a new credential.",
+            "OPENROUTER_API_KEY is not set, so the vision tier cannot run. "
+            "Add it to the .env file in the project root.",
         )
     return key
 
@@ -657,19 +666,18 @@ def _fit_for_inline_upload(png: bytes, raw_rgb: bytes, width: int, height: int) 
     47k-142k chars for 9 of its 10 shots) and are sent untouched at native
     resolution. Returns (png_to_send, scale_factor); factor 1 means the
     image was left exactly as captured."""
-    if len(base64.b64encode(png)) <= _NIM_MAX_INLINE_B64_CHARS:
+    if len(base64.b64encode(png)) <= _VISION_MAX_INLINE_B64_CHARS:
         return png, 1
     for factor in (2, 3, 4, 5, 6):
         small, new_w, new_h = _box_downscale(raw_rgb, width, height, factor)
         candidate = mss.tools.to_png(small, (new_w, new_h))
-        if len(base64.b64encode(candidate)) <= _NIM_MAX_INLINE_B64_CHARS:
+        if len(base64.b64encode(candidate)) <= _VISION_MAX_INLINE_B64_CHARS:
             return candidate, factor
     raise ClassifiedToolError(
         "state_failure",
         f"this window capture is {len(base64.b64encode(png)):,} base64 chars and will not fit "
-        f"under NVIDIA NIM's ~{_NIM_MAX_INLINE_B64_CHARS:,}-char inline image limit even "
-        "downscaled 6x. Target a smaller window, or route it through the NVCF asset API "
-        "(not implemented in this build).",
+        f"under the ~{_VISION_MAX_INLINE_B64_CHARS:,}-char inline image limit even "
+        "downscaled 6x. Target a smaller window.",
     )
 
 
@@ -991,7 +999,7 @@ class VisionLocateTool(BaseTool):
         multimodal and is not in this path at all."""
         import litellm
 
-        api_key = _nim_api_key()
+        api_key = _openrouter_api_key()
         try:
             response = litellm.completion(
                 model=_VISION_MODEL,
@@ -1111,5 +1119,55 @@ wait_for_visual_change_tool = WaitForVisualChangeTool(
         "Block until any pixel in `region` (default: primary monitor) "
         "changes, or `timeout` seconds elapse (capped at 60). Returns "
         "{changed: bool}.",
+    )
+)
+
+
+class UiMemoryLookupTool(BaseTool):
+    """ui_memory_lookup — look up a cached UI element position by process
+    name and description. Returns {x, y, automation_id, hits} or raises
+    state_failure if nothing is cached yet."""
+
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        result = db.ui_memory_lookup(args["process_name"], args["description"])
+        if result is None:
+            raise ClassifiedToolError(
+                "state_failure",
+                f"no ui_memory entry for process={args['process_name']!r} desc={args['description']!r}",
+            )
+        return result, Confidence.API_SUCCESS
+
+
+class UiMemoryStoreTool(BaseTool):
+    """ui_memory_upsert — cache a successful click position so future tasks
+    can skip the screenshot+locate round-trip. Lightweight: one DB row per
+    (process_name, description) pair, hit count incremented on re-use."""
+
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        db.ui_memory_upsert(
+            args["process_name"],
+            args["description"],
+            int(args["x"]),
+            int(args["y"]),
+            args.get("automation_id"),
+        )
+        return {"stored": True}, Confidence.API_SUCCESS
+
+
+ui_memory_lookup_tool = UiMemoryLookupTool(
+    _metadata(
+        "ui_memory_lookup",
+        "Return cached screen coordinates for a UI element by process name "
+        "and description. Returns {x, y, automation_id, hits}. Raises "
+        "state_failure when nothing is cached — take a screenshot instead.",
+    )
+)
+ui_memory_upsert_tool = UiMemoryStoreTool(
+    _metadata(
+        "ui_memory_upsert",
+        "Cache a successful click position: process_name (e.g. 'WINWORD.EXE'), "
+        "description (short, unique label), x, y (screen coords), optionally "
+        "automation_id. Future tasks call ui_memory_lookup first to skip "
+        "the screenshot step. Idempotent — hit count increments on re-use.",
     )
 )

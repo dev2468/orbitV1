@@ -112,17 +112,42 @@ def resolve_uia_element(
     win = _connect(window_handle)
 
     kwargs: dict[str, str] = {}
-    if automation_id:
-        kwargs["auto_id"] = automation_id
     if name:
         kwargs["title"] = name
     if control_type:
-        kwargs["control_type"] = control_type
+        try:
+            from pywinauto.uia_defines import IUIA
+            known = IUIA().known_control_types
+            normalized = next(
+                (k for k in known if k.lower() == control_type.lower().replace("_", "").replace(" ", "")),
+                control_type.title(),
+            )
+            kwargs["control_type"] = normalized
+        except Exception:
+            kwargs["control_type"] = control_type.title() if isinstance(control_type, str) else control_type
 
     try:
         candidates = win.descendants(**kwargs)
     except Exception as exc:
         raise ClassifiedToolError("state_failure", f"UIA lookup failed for {kwargs!r}: {exc}") from exc
+
+    if automation_id:
+        def _matches_aid(c) -> bool:
+            try:
+                aid = c.automation_id()
+                if aid and str(aid) == automation_id:
+                    return True
+            except Exception:
+                pass
+            try:
+                info_aid = getattr(getattr(c, "element_info", None), "automation_id", None)
+                if info_aid and str(info_aid) == automation_id:
+                    return True
+            except Exception:
+                pass
+            return False
+
+        candidates = [c for c in candidates if _matches_aid(c)]
 
     if not candidates:
         raise ClassifiedToolError(

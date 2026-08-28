@@ -85,9 +85,67 @@ def test_a_confident_uia_target_is_not_asked_about():
     ) is None
 
 
-def test_raw_coordinates_trigger_confirmation():
-    """_resolve_click_target scores raw {x, y} at VISION_INFERRED regardless
-    of where the numbers came from, so it must be asked about too."""
+def _policy(**overrides):
+    """A windows_control_policy dict with the fields confirmation.py reads."""
+    base = {"min_actuation_confidence": 0.70, "approval_token_ttl_seconds": 120}
+    base.update(overrides)
+    return base
+
+
+def test_raw_coordinates_are_asked_about_when_the_knob_is_on(monkeypatch):
+    """Whether a bare {x, y} needs a human yes is an operator setting
+    (windows_control_policy.yaml: confirm_raw_coordinate_clicks). With it ON,
+    the original behaviour holds: raw coordinates carry no resolver opinion,
+    so there is nothing to check them against and they get asked about."""
+    monkeypatch.setattr(
+        confirmation, "load_windows_control_policy",
+        lambda: _policy(confirm_raw_coordinate_clicks=True),
+    )
+    assert confirmation.target_needs_confirmation(
+        "windows_click", {"target": {"x": 100, "y": 200}}
+    ) is not None
+
+
+def test_raw_coordinates_proceed_when_the_knob_is_off(monkeypatch):
+    """With the knob OFF (what the shipped YAML sets, for vision-driven
+    control), a bare {x, y} proceeds without asking."""
+    monkeypatch.setattr(
+        confirmation, "load_windows_control_policy",
+        lambda: _policy(confirm_raw_coordinate_clicks=False),
+    )
+    assert confirmation.target_needs_confirmation(
+        "windows_click", {"target": {"x": 100, "y": 200}}
+    ) is None
+
+
+def test_turning_the_raw_coord_knob_off_does_not_relax_a_below_floor_elementref(monkeypatch):
+    """THE test for this knob. Switching off raw-coordinate confirmation must
+    NOT open a second door: an already-resolved ElementRef carrying a
+    below-floor confidence — exactly what perception_vision_locate returns —
+    still has to be approved by a human. The two cases are separate branches
+    and only the first one is configurable."""
+    monkeypatch.setattr(
+        confirmation, "load_windows_control_policy",
+        lambda: _policy(confirm_raw_coordinate_clicks=False),
+    )
+    assert confirmation.target_needs_confirmation(
+        "windows_click", {"target": _vision_target()}
+    ) is not None
+    # ...and a drag with one raw endpoint and one vision endpoint still asks,
+    # on the strength of the vision endpoint alone.
+    assert confirmation.target_needs_confirmation(
+        "windows_drag",
+        {"from_target": {"x": 1, "y": 1}, "to_target": _vision_target()},
+    ) is not None
+
+
+def test_absent_knob_defaults_to_asking(monkeypatch):
+    """A policy file written before this knob existed keeps the stricter
+    behaviour it was authored under rather than silently acquiring a laxer
+    one."""
+    monkeypatch.setattr(
+        confirmation, "load_windows_control_policy", lambda: _policy()
+    )
     assert confirmation.target_needs_confirmation(
         "windows_click", {"target": {"x": 100, "y": 200}}
     ) is not None
@@ -372,8 +430,8 @@ def test_every_benchmark_arm_model_has_a_known_provider_key():
 def test_a_missing_provider_key_fails_loudly_with_the_env_line(monkeypatch):
     from benchmarks.grounding_bench import _api_key_for
 
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: None)
-    with pytest.raises(RuntimeError) as exc:
-        _api_key_for("anthropic/claude-sonnet-4-5")
-    assert "ANTHROPIC_API_KEY" in str(exc.value)
+    with pytest.raises(Exception) as exc:
+        _api_key_for("openrouter/anthropic/claude-sonnet-4")
+    assert "OPENROUTER_API_KEY" in str(exc.value)

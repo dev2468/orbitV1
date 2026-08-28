@@ -23,6 +23,7 @@ from mcp.server.fastmcp import FastMCP
 from orbit import db
 from orbit.mcp_servers.windows_control_tools import (
     _resolve_task_id,
+    batch_actions_tool,
     click_tool,
     clipboard_copy_image_tool,
     drag_tool,
@@ -138,6 +139,29 @@ async def windows_focus_window(window_handle: int, task_id: str = "") -> Any:
     channel — expect confirmation_required, not an actual focus change."""
     result = await focus_window_tool.execute(
         {"window_handle": window_handle}, task_id=_resolve_task_id(task_id)
+    )
+    return _payload(result)
+
+
+@mcp.tool()
+async def windows_batch_actions(actions: list, task_id: str = "") -> Any:
+    """Chain multiple desktop actions into one tool call. Each action is a
+    dict with an 'action' key (click, type, key, scroll, open_app, wait)
+    plus action-specific params. Stops on first error. Returns combined
+    results plus a UIA tree checkpoint. Max 20 actions per batch.
+
+    Example actions list:
+      [
+        {"action": "open_app", "app_name_or_path": "notepad"},
+        {"action": "wait", "condition": {"type": "window_title", "value": "Notepad"}, "timeout": 10},
+        {"action": "type", "text": "Hello World"},
+        {"action": "key", "key_combo": "Ctrl+S"}
+      ]
+
+    Optional per-action: settle_delay (seconds to wait after the action,
+    default 0.3) lets the UI catch up between steps."""
+    result = await batch_actions_tool.execute(
+        {"actions": actions}, task_id=_resolve_task_id(task_id)
     )
     return _payload(result)
 

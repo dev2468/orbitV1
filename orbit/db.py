@@ -137,6 +137,21 @@ CREATE TABLE IF NOT EXISTS pending_confirmations (
     resolved_at      TEXT
 );
 
+-- Lightweight cache of successful UI element click positions. Keyed by
+-- (process_name, element_desc); hits incremented on re-use so frequently
+-- clicked elements bubble up. Token cost at query time: one short row.
+CREATE TABLE IF NOT EXISTS ui_memory (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    process_name TEXT NOT NULL COLLATE NOCASE,
+    element_desc TEXT NOT NULL COLLATE NOCASE,
+    x            INTEGER NOT NULL,
+    y            INTEGER NOT NULL,
+    automation_id TEXT,
+    hits         INTEGER NOT NULL DEFAULT 1,
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(process_name, element_desc)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type);
@@ -359,6 +374,43 @@ def purge_old_events(retention_days: int = 30) -> int:
             (cutoff, *sorted(_TERMINAL_STATUSES)),
         )
         return cur.rowcount
+
+
+def ui_memory_lookup(process_name: str, description: str) -> Optional[dict]:
+    """Return cached {x, y, automation_id, hits} for a (process, desc) pair,
+    or None if nothing is cached. COLLATE NOCASE — caller need not worry
+    about case."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT x, y, automation_id, hits FROM ui_memory "
+            "WHERE process_name = ? AND element_desc = ?",
+            (process_name, description),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"x": row[0], "y": row[1], "automation_id": row[2], "hits": row[3]}
+
+
+def ui_memory_upsert(
+    process_name: str,
+    description: str,
+    x: int,
+    y: int,
+    automation_id: Optional[str] = None,
+) -> None:
+    """Insert or update a cached click position; increment hit counter."""
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO ui_memory (process_name, element_desc, x, y, automation_id)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(process_name, element_desc) DO UPDATE SET
+                   x = excluded.x,
+                   y = excluded.y,
+                   automation_id = COALESCE(excluded.automation_id, ui_memory.automation_id),
+                   hits = hits + 1,
+                   updated_at = datetime('now')""",
+            (process_name, description, x, y, automation_id),
+        )
 
 
 def _fts_query(raw_query: str) -> Optional[str]:

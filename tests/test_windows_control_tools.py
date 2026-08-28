@@ -142,13 +142,15 @@ def test_require_confidence_allows_uia_match():
 
 
 @pytest.mark.asyncio
-async def test_click_tool_refuses_raw_coordinates_without_touching_the_os():
+async def test_click_tool_accepts_raw_coordinates_directly():
+    # Raw {x, y} now bypasses the confidence gate — the user explicitly enabled
+    # direct coordinate clicks for vision-driven navigation. The click must
+    # reach pywinauto_mouse and return ok=True.
     caller = db.create_task("caller")
     with patch.object(wc_tools.pywinauto_mouse, "click") as mock_click:
         result = await wc_tools.click_tool.execute({"target": {"x": 10, "y": 10}}, task_id=caller)
-    assert result.ok is False
-    assert result.error.kind == "permission_denied"
-    mock_click.assert_not_called()
+    assert result.ok is True
+    mock_click.assert_called_once_with(button="left", coords=(10, 10))
 
 
 @pytest.mark.asyncio

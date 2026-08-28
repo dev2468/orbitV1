@@ -59,5 +59,6 @@ def build_toolset(task_id: str = "") -> MCPToolset:
             "windows_key",
             "windows_open_app",
             "windows_clipboard_copy_image",
+            "windows_batch_actions",
         ],
     )

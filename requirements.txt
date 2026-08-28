@@ -13,5 +13,9 @@ pywin32
 # module docstring for the OCR/vision-tier libraries deliberately NOT added.
 mss
 PySide6
+# Voice pipeline: Deepgram Nova-3 (STT) + Aura-2 (TTS) over WebSocket.
+deepgram-sdk
+sounddevice
+numpy
 pytest
 pytest-asyncio

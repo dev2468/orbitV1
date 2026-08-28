@@ -63,7 +63,7 @@ from orbit.mcp_servers.perception_tools import (
     _VISION_MODEL,
     _VISION_PROMPT,
     _fit_for_inline_upload,
-    _nim_api_key,
+    _openrouter_api_key,
     _parse_vision_reply,
     _vision_point_to_screen,
 )
@@ -77,46 +77,19 @@ _CROP_ORIGIN = (100, 50)
 # must fail with the exact line to add to .env — not as a run of timeouts
 # that looks like the model grounding badly.
 _REQUIRED_KEY_BY_PREFIX = {
-    "nvidia_nim/": "NVIDIA_NIM_API_KEY",
-    "groq/": "GROQ_API_KEY",
-    "deepseek/": "DEEPSEEK_API_KEY",
-    "anthropic/": "ANTHROPIC_API_KEY",
     "openrouter/": "OPENROUTER_API_KEY",
-    "together_ai/": "TOGETHER_API_KEY",
 }
 
 
 def _api_key_for(model: str) -> str:
     """Resolve the credential this model needs, or say exactly what is missing.
 
-    NVIDIA keeps going through perception_tools._nim_api_key so the benchmark
-    and the live tool read the key the same way (it also loads .env, which
-    matters in a subprocess). Everything else reads the environment directly.
+    All models go through OpenRouter now. The key is read through
+    perception_tools._openrouter_api_key so the benchmark and the live tool
+    read the key the same way (it also loads .env, which matters in a
+    subprocess).
     """
-    if model.startswith("nvidia_nim/"):
-        return _nim_api_key()
-    for prefix, env_var in _REQUIRED_KEY_BY_PREFIX.items():
-        if model.startswith(prefix):
-            key = os.environ.get(env_var, "").strip()
-            if not key:
-                try:
-                    from dotenv import load_dotenv
-
-                    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-                    key = os.environ.get(env_var, "").strip()
-                except Exception:
-                    pass
-            if not key:
-                raise RuntimeError(
-                    f"{env_var} is not set, but arm model {model!r} needs it.\n"
-                    f"Add this line to the .env file in the project root:\n"
-                    f"    {env_var}=your-key-here"
-                )
-            return key
-    raise RuntimeError(
-        f"no provider key mapping for model {model!r} — add its prefix to "
-        "_REQUIRED_KEY_BY_PREFIX in benchmarks/grounding_bench.py"
-    )
+    return _openrouter_api_key()
 
 
 @dataclass

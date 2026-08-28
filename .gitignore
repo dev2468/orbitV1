@@ -19,3 +19,9 @@ data/quarantine/
 # Benchmark run artifacts: timestamped, machine-specific, and they embed raw
 # model replies. The harness and its fixtures are committed; its output is not.
 benchmarks/results/
+data/screenshots/
+data/*.backup-*
+MCP/venv/
+MCP/__pycache__/
+MCP/*.log
+MCP/task_debug.txt

@@ -49,13 +49,9 @@ run:
   # Transient provider failures are retried before being scored.
   #
   # This is not leniency toward the model — a reply that arrives and is wrong
-  # still counts as a miss. It is about not attributing NVIDIA's connection
-  # errors to grounding accuracy. The 2026-08-22 run made the case: at
-  # concurrency 4, 23 of 24 calls died with `Nvidia_nimException - Connection
-  # error` or a timeout, which would have been reported as a 4% hit-rate if
-  # errors were scored without retrying. An error that survives every retry
-  # is still counted as a miss (the spike's convention), just not a first
-  # blip.
+  # still counts as a miss. It is about not attributing provider connection
+  # errors to grounding accuracy. An error that survives every retry is still
+  # counted as a miss (the spike's convention), just not a first blip.
   max_retries: 3
   retry_backoff_s: 20
 
@@ -77,23 +73,16 @@ run:
 
 # --- Phase 6: model comparison ---------------------------------------------
 #
-# Alternate grounding models, all on the set_of_mark prompt so the only thing
-# varying between them is the model. Commented out rather than deleted: each
-# needs a credential this project does not currently hold, and an arm that
-# fails every call on a missing key would report as a 0% hit-rate — a
-# configuration gap wearing the costume of a result.
-#
-# Uncomment an arm once its key is in .env. benchmarks/grounding_bench.py's
-# _REQUIRED_KEY_BY_PREFIX (mirroring orbit/agent.py's) fails loudly with the
-# exact line to add, rather than letting it look like bad grounding.
+# Alternate grounding models, all via OpenRouter on the set_of_mark prompt
+# so the only thing varying between them is the model. Uncomment to enable.
 #
 #   - id: qwen2_vl_som
 #     prompt_shape: set_of_mark
-#     model: openrouter/qwen/qwen-2-vl-72b-instruct   # OPENROUTER_API_KEY
+#     model: openrouter/qwen/qwen-2-vl-72b-instruct
 #
 #   - id: claude_computer_use_som
 #     prompt_shape: set_of_mark
-#     model: anthropic/claude-sonnet-4-5              # ANTHROPIC_API_KEY
+#     model: openrouter/anthropic/claude-sonnet-4
 #
 # Run the comparison with every arm enabled:
 #   venv\Scripts\python.exe -m benchmarks.grounding_bench

@@ -57,6 +57,19 @@ def _floor() -> float:
     return float(load_windows_control_policy().get("min_actuation_confidence", 0.70))
 
 
+def _confirm_raw_coords() -> bool:
+    """Whether a bare {x, y} click needs a human yes.
+
+    Defaults to True when the key is absent: a config file that predates this
+    knob should keep the stricter behaviour it was written under, not
+    silently acquire a laxer one. The shipped YAML sets it False — see the
+    reasoning next to `confirm_raw_coordinate_clicks` there.
+    """
+    return bool(
+        load_windows_control_policy().get("confirm_raw_coordinate_clicks", True)
+    )
+
+
 def _ttl_seconds() -> int:
     """Approval lifetime, from windows_control_policy.yaml.
 
@@ -94,10 +107,18 @@ def target_needs_confirmation(tool_name: str, tool_args: dict) -> Optional[dict]
     for target in targets:
         if not isinstance(target, dict):
             continue
-        # A raw {x, y} is scored VISION_INFERRED by _resolve_click_target no
-        # matter where the numbers came from, so it needs asking too.
+        # A raw {x, y} carries no resolver opinion at all — there is nothing
+        # to check it against, which is why it used to be asked about
+        # unconditionally. Vision-driven control made that impractical (a
+        # single task issues dozens of coordinate clicks), so it is now an
+        # operator setting rather than a fixed rule. Note this branch is
+        # checked BEFORE the confidence branch below and returns early, so
+        # turning it off cannot affect a target that carries a real
+        # below-floor `confidence` — that still gets asked about.
         if "x" in target and "y" in target and "confidence" not in target:
-            return target
+            if _confirm_raw_coords():
+                return target
+            continue
         confidence = target.get("confidence")
         if confidence is not None and float(confidence) < _floor():
             return target

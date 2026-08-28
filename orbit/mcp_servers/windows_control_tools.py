@@ -506,7 +506,15 @@ class ClickTool(BaseTool):
     outright — see _require_confidence and the module docstring."""
 
     async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
-        element = _resolve_click_target(args["target"])
+        target = args["target"]
+        # Raw {x, y} coordinate click — bypass confidence gate entirely.
+        # The user explicitly enabled direct coordinate clicks for vision-driven
+        # navigation: perception_capture_screenshot → see screenshot → click {x,y}.
+        if isinstance(target, dict) and set(target.keys()) <= {"x", "y"} and "x" in target:
+            cx, cy = int(target["x"]), int(target["y"])
+            pywinauto_mouse.click(button="left", coords=(cx, cy))
+            return {"clicked": {"x": cx, "y": cy, "source": "direct_coords"}}, Confidence.VISION_INFERRED
+        element = _resolve_click_target(target)
         _require_confidence(element, args.get("approval_token"))
         x, y = element.center()
         pywinauto_mouse.click(button="left", coords=(x, y))
@@ -695,6 +703,207 @@ class ClipboardCopyImageTool(BaseTool):
                     pass
 
 
+class BatchActionsTool(BaseTool):
+    """windows_batch_actions — chains multiple desktop actions into one tool
+    call, reducing LLM round-trips. Each action maps to an existing tool
+    (click, type, key, scroll, open_app, wait) and inherits all of its
+    safety checks (confidence gating, blocked combos, etc.). Execution is
+    sequential and stops on the first error. A brief settle delay between
+    actions lets the UI catch up. Returns combined results plus a UIA tree
+    snapshot of the foreground window at the end as a checkpoint."""
+
+    default_timeout_s = 120.0
+
+    _SETTLE_DELAY_S = 0.3
+    _SUPPORTED_ACTIONS = frozenset({
+        "click", "type", "key", "scroll", "open_app", "wait",
+    })
+
+    async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
+        actions = args.get("actions")
+        if not actions or not isinstance(actions, list):
+            raise ClassifiedToolError(
+                "reasoning_failure",
+                "actions must be a non-empty list of action dicts",
+            )
+        if len(actions) > 20:
+            raise ClassifiedToolError(
+                "reasoning_failure",
+                f"too many actions ({len(actions)}); max 20 per batch to keep "
+                "execution bounded. Split into multiple batch calls.",
+            )
+
+        results: list[dict] = []
+        min_confidence = Confidence.API_SUCCESS
+
+        for i, action in enumerate(actions):
+            token.raise_if_cancelled()
+
+            action_type = action.get("action")
+            if action_type not in self._SUPPORTED_ACTIONS:
+                raise ClassifiedToolError(
+                    "reasoning_failure",
+                    f"action[{i}]: unknown action type {action_type!r}. "
+                    f"Supported: {', '.join(sorted(self._SUPPORTED_ACTIONS))}",
+                )
+
+            try:
+                data, confidence = await self._dispatch(action_type, action, token)
+            except ClassifiedToolError as exc:
+                results.append({
+                    "step": i,
+                    "action": action_type,
+                    "error": exc.kind,
+                    "message": exc.message,
+                })
+                return {
+                    "completed": i,
+                    "total": len(actions),
+                    "results": results,
+                    "stopped_early": True,
+                }, min_confidence
+
+            if confidence is not None and confidence < min_confidence:
+                min_confidence = confidence
+            results.append({"step": i, "action": action_type, "ok": True, "data": data})
+
+            settle = float(action.get("settle_delay", self._SETTLE_DELAY_S))
+            if settle > 0 and i < len(actions) - 1:
+                await asyncio.sleep(settle)
+
+        checkpoint = self._take_checkpoint()
+
+        return {
+            "completed": len(actions),
+            "total": len(actions),
+            "results": results,
+            "stopped_early": False,
+            "checkpoint": checkpoint,
+        }, min_confidence
+
+    async def _dispatch(
+        self, action_type: str, action: dict, token: CancellationToken
+    ) -> tuple[Any, Optional[float]]:
+        if action_type == "click":
+            target = action.get("target")
+            if not target:
+                raise ClassifiedToolError("reasoning_failure", "click action requires 'target'")
+            element = _resolve_click_target(target)
+            _require_confidence(element, action.get("approval_token"))
+            x, y = element.center()
+            pywinauto_mouse.click(button="left", coords=(x, y))
+            return {"clicked": element.model_dump()}, element.confidence
+
+        if action_type == "type":
+            text = action.get("text")
+            if not text:
+                raise ClassifiedToolError("reasoning_failure", "type action requires 'text'")
+            target = action.get("target")
+            confidence = Confidence.API_SUCCESS
+            if target:
+                element = _resolve_click_target(target)
+                _require_confidence(element)
+                x, y = element.center()
+                pywinauto_mouse.click(button="left", coords=(x, y))
+                confidence = element.confidence
+            previous = _get_clipboard_text_safe()
+            try:
+                _set_clipboard_text(text)
+                pywinauto_keyboard.send_keys("^v", pause=0.05)
+            finally:
+                if previous is not None:
+                    _set_clipboard_text(previous)
+            return {"typed_chars": len(text)}, confidence
+
+        if action_type == "key":
+            combo = action.get("key_combo")
+            if not combo:
+                raise ClassifiedToolError("reasoning_failure", "key action requires 'key_combo'")
+            if _is_blocked_combo(combo):
+                raise ClassifiedToolError(
+                    "permission_denied",
+                    f"{combo!r} is a blocked destructive/system key combination",
+                )
+            send_keys_str = _parse_key_combo(combo)
+            pywinauto_keyboard.send_keys(send_keys_str, pause=0.02)
+            return {"sent": combo}, Confidence.API_SUCCESS
+
+        if action_type == "scroll":
+            direction = action.get("direction", "down")
+            if direction not in ("up", "down"):
+                raise ClassifiedToolError(
+                    "reasoning_failure", f"scroll direction must be 'up' or 'down', got {direction!r}"
+                )
+            amount = int(action.get("amount", 3))
+            target = action.get("target")
+            if target:
+                element = _resolve_click_target(target)
+                _require_confidence(element)
+                x, y = element.center()
+            else:
+                hwnd = win32gui.GetForegroundWindow()
+                if not hwnd:
+                    raise ClassifiedToolError("state_failure", "no foreground window to scroll")
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                x, y = (left + right) // 2, (top + bottom) // 2
+            wheel_dist = amount if direction == "up" else -amount
+            pywinauto_mouse.scroll(coords=(x, y), wheel_dist=wheel_dist)
+            return {"direction": direction, "amount": amount}, Confidence.API_SUCCESS
+
+        if action_type == "open_app":
+            app = action.get("app_name_or_path")
+            if not app:
+                raise ClassifiedToolError("reasoning_failure", "open_app action requires 'app_name_or_path'")
+            try:
+                os.startfile(app)
+            except OSError as exc:
+                raise ClassifiedToolError("state_failure", f"could not launch {app!r}: {exc}") from exc
+            return {"launched": app}, Confidence.API_SUCCESS
+
+        if action_type == "wait":
+            condition = action.get("condition")
+            if not condition:
+                raise ClassifiedToolError("reasoning_failure", "wait action requires 'condition'")
+            timeout = min(float(action.get("timeout", 10.0)), 60.0)
+            ctype = condition.get("type")
+            value = condition.get("value")
+            if ctype not in ("window_title", "process_running", "process_exited"):
+                raise ClassifiedToolError(
+                    "reasoning_failure",
+                    f"unrecognized condition type {ctype!r}",
+                )
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                token.raise_if_cancelled()
+                if ctype == "window_title" and find_window_by_title_substring(value) is not None:
+                    return {"satisfied": True, "condition": condition}, Confidence.API_SUCCESS
+                if ctype == "process_running" and is_process_running(value):
+                    return {"satisfied": True, "condition": condition}, Confidence.API_SUCCESS
+                if ctype == "process_exited" and not is_process_running(value):
+                    return {"satisfied": True, "condition": condition}, Confidence.API_SUCCESS
+                await asyncio.sleep(0.3)
+            raise ClassifiedToolError(
+                "state_failure", f"condition {condition!r} not satisfied within {timeout}s"
+            )
+
+        raise ClassifiedToolError("reasoning_failure", f"unhandled action type: {action_type!r}")
+
+    @staticmethod
+    def _take_checkpoint() -> dict:
+        """Snapshot the foreground window's state as a checkpoint."""
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return {"foreground_window": None}
+        snap = window_snapshot(hwnd)
+        try:
+            from orbit.mcp_servers.uia_resolver import get_uia_tree
+            tree = get_uia_tree(hwnd, max_depth=4, max_nodes=100)
+            snap["uia_tree"] = tree
+        except Exception:
+            snap["uia_tree"] = None
+        return snap
+
+
 def _metadata(name: str, description: str, **overrides) -> ToolMetadata:
     fields = {**_MEDIUM_FOREGROUND, **overrides}
     return ToolMetadata(name=name, description=description, **fields)
@@ -791,5 +1000,15 @@ clipboard_copy_image_tool = ClipboardCopyImageTool(
         "on disk, or image_base64 for raw data from "
         "perception_capture_screenshot.",
         risk_tier="low",
+    )
+)
+batch_actions_tool = BatchActionsTool(
+    _metadata(
+        "windows_batch_actions",
+        "Chain multiple desktop actions (click, type, key, scroll, "
+        "open_app, wait) into one tool call. Each action inherits the "
+        "same safety checks as the standalone tool. Stops on the first "
+        "error. Returns combined results plus a UIA tree checkpoint of "
+        "the foreground window at the end. Max 20 actions per batch.",
     )
 )

@@ -35,7 +35,10 @@ def build_toolset(task_id: str = "") -> MCPToolset:
                 args=[_SERVER_SCRIPT],
                 env={"ORBIT_TASK_ID": task_id} if task_id else None,
             ),
-            timeout=30,
+            timeout=120,  # run_command can take >30s (pip, python scripts);
+            # timeout controls BOTH connection and per-request read timeout
+            # for stdio connections (session_context.py:318), so 30s is too
+            # short for any non-trivial command.
         ),
         tool_filter=[
             "list_files",

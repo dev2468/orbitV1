@@ -49,5 +49,7 @@ def build_toolset(task_id: str = "") -> MCPToolset:
             "perception_vision_locate",
             "perception_capture_screenshot",
             "perception_wait_for_visual_change",
+            "ui_memory_lookup",
+            "ui_memory_upsert",
         ],
     )

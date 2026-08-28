@@ -13,3 +13,21 @@ blocklist_keywords:
   - "/admin/"
   - login.microsoftonline
   - accounts.google.com/signin
+
+# Hard ceiling on the characters any single content-bearing browser tool
+# (browser_snapshot / browser_extract / browser_tab_list) may return to the
+# model. Mirrors filesystem_policy.yaml's max_read_bytes, and for a sharper
+# reason: an accessibility snapshot of a heavy page (YouTube, Amazon search,
+# a social feed) measured 621,442 characters in this build's own event log —
+# roughly 155,000 tokens for ONE call. Because every tool result stays in the
+# conversation and is re-sent with every subsequent LLM request, one such
+# snapshot is re-billed on every remaining turn of the task. Measured across
+# the event log, browser_snapshot alone accounted for 12.0M of 13.8M total
+# result characters.
+#
+# 12,000 chars (~3,000 tokens) keeps a snapshot genuinely useful — it is far
+# more than a page's interactive elements and visible headings need — while
+# making the pathological case impossible. Truncation is explicit in the
+# returned text, never silent, so the model can scroll or narrow its query
+# rather than assuming it saw the whole page.
+max_content_chars: 12000

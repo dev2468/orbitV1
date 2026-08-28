@@ -83,7 +83,7 @@ same guarantee.
 
 Several tests spawn real Chrome via `npx`, make real network calls, and run the real LLM
 (`test_adversarial.py`'s two injection tests, `test_browser_policy_tools.py`'s round trip, the reaper
-tests). They need network, `npx`, and a working `NVIDIA_NIM_API_KEY`, and they cost tokens. A
+tests). They need network, `npx`, and a working `OPENROUTER_API_KEY`, and they cost tokens. A
 failure there is as likely to be environmental as a regression — check before assuming the code
 broke.
 
