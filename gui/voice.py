@@ -18,6 +18,7 @@ from typing import Optional
 
 import numpy as np
 import sounddevice as sd
+from dotenv import load_dotenv
 from PySide6.QtCore import (
     QAbstractNativeEventFilter,
     QObject,
@@ -41,38 +42,54 @@ _WM_HOTKEY = 0x0312
 _HOTKEY_ID = 42
 _VK_F9 = 0x78
 _MOD_NONE = 0
+_MOD_NOREPEAT = 0x4000  # Windows 8+: suppress key-repeat WM_HOTKEY floods
 _SAMPLE_RATE = 16_000
 _BLOCK_MS = 20
 _BLOCK_SIZE = _SAMPLE_RATE * _BLOCK_MS // 1000  # 320 samples per 20 ms
 
+load_dotenv()  # ensure .env is loaded in the GUI process
+
 
 # ── Phase 1 — Global hotkey ──────────────────────────────────────────────────
+
+class _HotkeySignals(QObject):
+    toggled = Signal()
+
 
 class HotkeyFilter(QAbstractNativeEventFilter):
     """Intercepts Win32 WM_HOTKEY from Qt's native event loop.
 
-    Install with `QApplication.instance().installNativeEventFilter(filter)`.
-    The `toggled` signal fires on every press; VoiceController.toggle()
-    treats alternating presses as start / stop.
-    """
+    QAbstractNativeEventFilter is not a QObject, so Signal must live on a
+    separate QObject (_HotkeySignals). Access via `filter.toggled`.
 
-    toggled = Signal()
+    Install with `QApplication.instance().installNativeEventFilter(filter)`.
+    """
 
     def __init__(self, vk: int = _VK_F9) -> None:
         super().__init__()
+        self._signals = _HotkeySignals()
         self._registered = False
         try:
-            ok = ctypes.windll.user32.RegisterHotKey(None, _HOTKEY_ID, _MOD_NONE, vk)
+            # MOD_NOREPEAT (0x4000) prevents key-repeat from firing WM_HOTKEY
+            # repeatedly when the key is held down — without it every repeat
+            # fires toggle(), spawning a new session thread each time.
+            ok = ctypes.windll.user32.RegisterHotKey(
+                None, _HOTKEY_ID, _MOD_NOREPEAT, vk
+            )
             self._registered = bool(ok)
         except Exception:
             pass  # not on Windows, or another app holds the key
+
+    @property
+    def toggled(self):
+        return self._signals.toggled
 
     def nativeEventFilter(self, event_type: bytes, message: object) -> tuple[bool, int]:
         if event_type == b"windows_generic_MSG":
             try:
                 msg = ctypes.wintypes.MSG.from_address(int(message))  # type: ignore[arg-type]
                 if msg.message == _WM_HOTKEY and msg.wParam == _HOTKEY_ID:
-                    self.toggled.emit()
+                    self._signals.toggled.emit()
             except Exception:
                 pass
         return False, 0
@@ -111,11 +128,11 @@ class VoiceController(QObject):
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
-        self._active = False
+        self._active = False      # True while mic+Deepgram session is live
+        self._thread_alive = False  # True from thread-start to thread-exit
         self._lock = threading.Lock()
         self._segments: list[str] = []
         self._interim: str = ""
-        self._api_key = os.environ.get("DEEPGRAM_API_KEY", "")
 
     @property
     def is_active(self) -> bool:
@@ -123,15 +140,24 @@ class VoiceController(QObject):
 
     def toggle(self) -> None:
         with self._lock:
-            if self._active:
-                self._active = False  # signals session thread to wind down
-            else:
+            if self._thread_alive:
+                # Session is running — signal it to stop
+                self._active = False
+            elif not self._active:
+                # No session running — start one
                 self._start_locked()
 
     def _start_locked(self) -> None:
-        if not _DEEPGRAM_AVAILABLE or not self._api_key:
+        api_key = os.environ.get("DEEPGRAM_API_KEY", "")
+        if not _DEEPGRAM_AVAILABLE:
+            print("[voice] deepgram-sdk not available", flush=True)
             return
+        if not api_key:
+            print("[voice] DEEPGRAM_API_KEY not set in .env", flush=True)
+            return
+        self._api_key = api_key
         self._active = True
+        self._thread_alive = True
         self._segments = []
         self._interim = ""
         threading.Thread(target=self._session_thread, daemon=True).start()
@@ -143,6 +169,7 @@ class VoiceController(QObject):
         ctrl = self  # avoid name-shadowing `self` in nested closures
 
         try:
+            print("[voice] connecting to Deepgram…", flush=True)
             client = DeepgramClient(api_key=ctrl._api_key)
 
             with client.listen.v1.connect(
@@ -214,6 +241,7 @@ class VoiceController(QObject):
                     blocksize=_BLOCK_SIZE,
                     callback=audio_callback,
                 ):
+                    print("[voice] mic open, streaming…", flush=True)
                     stop_event.wait()  # blocks until _active flips or send_media fails
 
                 # Gracefully flush then close the WebSocket.
@@ -224,10 +252,13 @@ class VoiceController(QObject):
                     pass
                 listener_done.wait(timeout=3.0)
 
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[voice] session error: {exc}", flush=True)
         finally:
-            ctrl._active = False
+            with ctrl._lock:
+                ctrl._active = False
+                ctrl._thread_alive = False
+            print("[voice] session ended", flush=True)
 
         parts = list(ctrl._segments)
         if ctrl._interim:

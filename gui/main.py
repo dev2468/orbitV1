@@ -299,7 +299,7 @@ QMainWindow {{
 #stopBtn:hover {{ background-color: #DC2626; }}
 
 #micBtn {{
-    background-color: {_SURFACE};
+    background-color: {_BG_CARD};
     border: 1.5px solid {_BORDER};
     border-radius: 18px;
     font-size: 16px;
@@ -656,6 +656,7 @@ class OrbitWindow(QMainWindow):
         self._worker: QProcess | None = None      # persistent warm worker
         self._task_running: bool = False           # True while a task is in flight
         self._voice_ctrl: VoiceController | None = None
+        self._committed_text = ""
         self._raw_buffer = ""
         self._goal_header = ""
         self._auto_scroll = True
@@ -1075,6 +1076,7 @@ class OrbitWindow(QMainWindow):
     def _on_voice_started(self) -> None:
         self._voice_panel.show()
         self._transcript_lbl.setText("")
+        self._committed_text = ""  # track final segments separately from interims
         self._voice_status_lbl.setText("Listening… (F9 to stop)")
         self.mic_btn.setStyleSheet("background:#6366f1;color:white;border-radius:18px;")
 
@@ -1084,24 +1086,17 @@ class OrbitWindow(QMainWindow):
         self.mic_btn.setStyleSheet("")
 
     def _on_transcript_interim(self, text: str) -> None:
-        segments = self._transcript_lbl.text()
-        # Show committed segments + current interim in italic
-        base = segments.rsplit("\n", 1)[0] if "\n" in segments else ""
-        display = (base + "\n" + text).strip() if base else text
+        display = (self._committed_text + " " + text).strip() if self._committed_text else text
         self._transcript_lbl.setText(display)
 
     def _on_transcript_final(self, text: str) -> None:
-        current = self._transcript_lbl.text()
-        self._transcript_lbl.setText((current + "\n" + text).strip())
+        self._committed_text = (self._committed_text + " " + text).strip()
+        self._transcript_lbl.setText(self._committed_text)
 
     def _on_transcript_ready(self, text: str) -> None:
         if text:
             self.goal_input.setText(text)
             self.goal_input.setFocus()
-            self._voice_status_lbl.setText("Edit transcript then press Enter ↵")
-            # Keep the panel visible briefly so the user sees the final text
-            self._voice_panel.show()
-            QTimer.singleShot(200, lambda: self._voice_panel.hide())
 
     # -- Navigation Switcher --------------------------------------------------
 
