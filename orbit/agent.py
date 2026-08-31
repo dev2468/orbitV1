@@ -51,7 +51,7 @@ load_dotenv()
 
 # All LLM calls go through OpenRouter (https://openrouter.ai).
 # LiteLLM routes on the "openrouter/" prefix; OpenRouter needs OPENROUTER_API_KEY.
-DEFAULT_MODEL = "openrouter/google/gemini-3.7-flash"
+DEFAULT_MODEL = "openrouter/google/gemini-3.7-flash:batch"
 
 _REQUIRED_KEY_BY_PREFIX = {
     "openrouter/": "OPENROUTER_API_KEY",
@@ -246,7 +246,18 @@ _ORBIT_INSTRUCTION_SUFFIX = (
     "- Scripts must be self-contained: hardcode example inputs. There is no "
     "terminal attached, so input()/sys.stdin never returns anything.\n"
     "- Print results to stdout — that output is what you get back and what "
-    "you can paste into a document."
+    "you can paste into a document.\n\n"
+    "STEP MARKERS: At the start of each logical phase of your work, print exactly:\n"
+    "[STEP:START] <short description>\n"
+    "When that phase completes, print:\n"
+    "[STEP:DONE] <same description>\n"
+    "If a phase fails, print:\n"
+    "[STEP:FAIL] <same description> — <reason>\n"
+    "For progress within a long phase, print:\n"
+    "[STEP:PROGRESS] <same description> — <detail>\n"
+    "Keep descriptions short (under 60 chars). A task typically has 3-8 steps.\n"
+    "Examples of good step boundaries: \"Opening Word document\", \"Writing Python script\",\n"
+    "\"Running the code\", \"Taking screenshot of output\", \"Saving as PDF\".\n"
 )
 
 WINDOWS_CONTROL_INSTRUCTION = (

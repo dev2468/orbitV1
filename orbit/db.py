@@ -287,6 +287,20 @@ def log_event(
         return cur.lastrowid
 
 
+def list_events(task_id: Optional[str] = None, limit: int = 100) -> list[dict]:
+    """Retrieve event rows, optionally filtered by task_id."""
+    sql = "SELECT * FROM events"
+    params: list[Any] = []
+    if task_id:
+        sql += " WHERE task_id = ?"
+        params.append(task_id)
+    sql += " ORDER BY event_id ASC LIMIT ?"
+    params.append(limit)
+    with get_connection() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+
 MEMORY_TYPES = {"episodic", "semantic", "procedural", "project"}
 PROVENANCE_VALUES = {"user", "system", "external"}
 
@@ -456,17 +470,18 @@ def get_task(task_id: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
-def list_tasks(*, status: Optional[str] = None) -> list[dict]:
+def list_tasks(*, status: Optional[str] = None, limit: Optional[int] = None) -> list[dict]:
     with get_connection() as conn:
+        sql = "SELECT * FROM tasks"
+        params: list[Any] = []
         if status:
-            rows = conn.execute(
-                "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC",
-                (status,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM tasks ORDER BY created_at DESC"
-            ).fetchall()
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
 

@@ -25,3 +25,19 @@ MCP/venv/
 MCP/__pycache__/
 MCP/*.log
 MCP/task_debug.txt
+
+# Office lock files (only exist while a doc is open in Word)
+~$*
+# Coursework / personal docs that live in this folder by accident, not project files
+Experiment No.*.docx
+Experiment No.*.pdf
+output_test_case_*.png
+terminal_output_*.png
+# One-off string-replacement scripts used to build gui/history_view.py, and the
+# intermediate copies they produced. Superseded by the committed file itself.
+fix.py
+fix_table.py
+tweaks.py
+restore_widget.py
+history_view_version_*.py
+old_history_view.txt
