@@ -63,6 +63,7 @@ from orbit import db
 from orbit.policy import load_windows_control_policy
 from gui.step_tracker import StepTracker, StepStatus
 from gui.history_view import TaskHistoryView
+from gui.voice import HotkeyFilter, OrbWidget, VoiceController
 
 _VENV_PYTHON = str(Path(_PROJECT_ROOT) / "venv" / "Scripts" / "python.exe")
 
@@ -296,6 +297,16 @@ QMainWindow {{
     font-weight: 700;
 }}
 #stopBtn:hover {{ background-color: #DC2626; }}
+
+#micBtn {{
+    background-color: {_SURFACE};
+    border: 1.5px solid {_BORDER};
+    border-radius: 18px;
+    font-size: 16px;
+    padding: 0px;
+}}
+#micBtn:hover {{ background-color: {_INDIGO_LIGHT}; border-color: {_INDIGO}; }}
+#micBtn:pressed {{ background-color: {_INDIGO}; color: white; }}
 
 /* ---- floating approval banner ---- */
 #approvalBanner {{
@@ -644,6 +655,7 @@ class OrbitWindow(QMainWindow):
 
         self._worker: QProcess | None = None      # persistent warm worker
         self._task_running: bool = False           # True while a task is in flight
+        self._voice_ctrl: VoiceController | None = None
         self._raw_buffer = ""
         self._goal_header = ""
         self._auto_scroll = True
@@ -759,6 +771,14 @@ class OrbitWindow(QMainWindow):
         self.goal_input.returnPressed.connect(self._submit_task)
         input_layout.addWidget(self.goal_input, stretch=1)
 
+        self.mic_btn = QPushButton("🎙")
+        self.mic_btn.setObjectName("micBtn")
+        self.mic_btn.setToolTip("Voice input (F9)")
+        self.mic_btn.setCursor(Qt.PointingHandCursor)
+        self.mic_btn.setFixedSize(36, 36)
+        self.mic_btn.clicked.connect(self._toggle_voice)
+        input_layout.addWidget(self.mic_btn)
+
         self.send_btn = QPushButton("Send ↵")
         self.send_btn.setObjectName("sendBtn")
         self.send_btn.setCursor(Qt.PointingHandCursor)
@@ -773,6 +793,31 @@ class OrbitWindow(QMainWindow):
         input_layout.addWidget(self.stop_btn)
 
         wb_page_lay.addWidget(input_card)
+
+        # Voice overlay — shown while F9 session is active
+        self._voice_panel = QFrame()
+        self._voice_panel.setObjectName("voicePanel")
+        self._voice_panel.hide()
+        vp_lay = QVBoxLayout(self._voice_panel)
+        vp_lay.setContentsMargins(0, 8, 0, 4)
+        vp_lay.setSpacing(6)
+        vp_lay.setAlignment(Qt.AlignHCenter)
+
+        self._orb = OrbWidget()
+        vp_lay.addWidget(self._orb, alignment=Qt.AlignHCenter)
+
+        self._voice_status_lbl = QLabel("Listening… (F9 to stop)")
+        self._voice_status_lbl.setAlignment(Qt.AlignCenter)
+        self._voice_status_lbl.setStyleSheet("color:#6366f1;font-size:12px;font-weight:600;")
+        vp_lay.addWidget(self._voice_status_lbl)
+
+        self._transcript_lbl = QLabel("")
+        self._transcript_lbl.setWordWrap(True)
+        self._transcript_lbl.setAlignment(Qt.AlignCenter)
+        self._transcript_lbl.setStyleSheet("color:#374151;font-size:13px;font-style:italic;")
+        vp_lay.addWidget(self._transcript_lbl)
+
+        wb_page_lay.addWidget(self._voice_panel)
 
         # Progress Bar
         self.progress = QProgressBar()
@@ -1006,6 +1051,57 @@ class OrbitWindow(QMainWindow):
         self.refresh_timer.start(2000)
         self._refresh_data()
         self._set_status("idle")
+        self._setup_voice()
+
+    # -- Voice ----------------------------------------------------------------
+
+    def _setup_voice(self) -> None:
+        self._voice_ctrl = VoiceController(self)
+        self._voice_ctrl.session_started.connect(self._on_voice_started)
+        self._voice_ctrl.session_stopped.connect(self._on_voice_stopped)
+        self._voice_ctrl.volume_rms.connect(self._orb.set_volume)
+        self._voice_ctrl.transcript_interim.connect(self._on_transcript_interim)
+        self._voice_ctrl.transcript_final_segment.connect(self._on_transcript_final)
+        self._voice_ctrl.transcript_ready.connect(self._on_transcript_ready)
+
+        self._hotkey_filter = HotkeyFilter()
+        self._hotkey_filter.toggled.connect(self._toggle_voice)
+        QApplication.instance().installNativeEventFilter(self._hotkey_filter)
+
+    def _toggle_voice(self) -> None:
+        if self._voice_ctrl:
+            self._voice_ctrl.toggle()
+
+    def _on_voice_started(self) -> None:
+        self._voice_panel.show()
+        self._transcript_lbl.setText("")
+        self._voice_status_lbl.setText("Listening… (F9 to stop)")
+        self.mic_btn.setStyleSheet("background:#6366f1;color:white;border-radius:18px;")
+
+    def _on_voice_stopped(self) -> None:
+        self._voice_panel.hide()
+        self._orb.set_volume(0.0)
+        self.mic_btn.setStyleSheet("")
+
+    def _on_transcript_interim(self, text: str) -> None:
+        segments = self._transcript_lbl.text()
+        # Show committed segments + current interim in italic
+        base = segments.rsplit("\n", 1)[0] if "\n" in segments else ""
+        display = (base + "\n" + text).strip() if base else text
+        self._transcript_lbl.setText(display)
+
+    def _on_transcript_final(self, text: str) -> None:
+        current = self._transcript_lbl.text()
+        self._transcript_lbl.setText((current + "\n" + text).strip())
+
+    def _on_transcript_ready(self, text: str) -> None:
+        if text:
+            self.goal_input.setText(text)
+            self.goal_input.setFocus()
+            self._voice_status_lbl.setText("Edit transcript then press Enter ↵")
+            # Keep the panel visible briefly so the user sees the final text
+            self._voice_panel.show()
+            QTimer.singleShot(200, lambda: self._voice_panel.hide())
 
     # -- Navigation Switcher --------------------------------------------------
 
