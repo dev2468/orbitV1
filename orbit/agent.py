@@ -51,7 +51,7 @@ load_dotenv()
 
 # All LLM calls go through OpenRouter (https://openrouter.ai).
 # LiteLLM routes on the "openrouter/" prefix; OpenRouter needs OPENROUTER_API_KEY.
-DEFAULT_MODEL = "openrouter/google/gemini-3.7-flash:batch"
+DEFAULT_MODEL = "openrouter/google/gemini-3.7-flash"
 
 _REQUIRED_KEY_BY_PREFIX = {
     "openrouter/": "OPENROUTER_API_KEY",

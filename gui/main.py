@@ -5,6 +5,7 @@ Gemini effort selector, full-window task history inspector, and slide-out approv
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import time
@@ -641,7 +642,8 @@ class OrbitWindow(QMainWindow):
         self.resize(1180, 800)
         self.setMinimumSize(880, 600)
 
-        self.process: QProcess | None = None
+        self._worker: QProcess | None = None      # persistent warm worker
+        self._task_running: bool = False           # True while a task is in flight
         self._raw_buffer = ""
         self._goal_header = ""
         self._auto_scroll = True
@@ -1081,28 +1083,40 @@ class OrbitWindow(QMainWindow):
 
     # -- Task Submission ------------------------------------------------------
 
+    def _ensure_worker(self) -> None:
+        """Spawn the warm worker process if it is not already running.
+
+        The worker runs `orbit.run_task --serve`, which reads one JSON goal
+        line per task from stdin and emits [TASK:DONE exit_code] when done.
+        Python imports + the event loop pay their cost once at GUI startup;
+        subsequent tasks skip the 7–8 s cold-start and go straight to the
+        first LLM call.
+        """
+        if self._worker is not None and self._worker.state() != QProcess.NotRunning:
+            return
+        env = QProcess.systemEnvironment()
+        w = QProcess(self)
+        w.setEnvironment(env)
+        w.setProcessChannelMode(QProcess.SeparateChannels)
+        w.readyReadStandardOutput.connect(self._read_stdout)
+        w.readyReadStandardError.connect(self._read_stderr)
+        w.finished.connect(self._worker_exited)
+        w.start(_VENV_PYTHON, ["-m", "orbit.run_task", "--serve"])
+        self._worker = w
+
     def _submit_task(self) -> None:
         goal = self.goal_input.text().strip()
-        if not goal or self.process is not None:
+        if not goal or self._task_running:
             return
 
         lane = self.lane_toggle.value()
         effort = self.effort_combo.currentText().lower()
 
-        args = ["-m", "orbit.run_task"]
-        if lane == "foreground":
-            args.append("--foreground")
-        args.extend(goal.split())
+        self._ensure_worker()
 
-        env = QProcess.systemEnvironment()
-        env.append(f"ORBIT_EFFORT={effort}")
-
-        self.process = QProcess(self)
-        self.process.setEnvironment(env)
-        self.process.setProcessChannelMode(QProcess.SeparateChannels)
-        self.process.readyReadStandardOutput.connect(self._read_stdout)
-        self.process.readyReadStandardError.connect(self._read_stderr)
-        self.process.finished.connect(self._task_finished)
+        req = json.dumps({"goal": goal, "lane": lane, "effort": effort})
+        self._worker.write((req + "\n").encode())  # type: ignore[union-attr]
+        self._task_running = True
 
         self._raw_buffer = ""
         self._goal_header = f"> {goal}\n  ({lane} | effort: {effort})\n"
@@ -1116,8 +1130,6 @@ class OrbitWindow(QMainWindow):
         self._append_plain(f"> {goal}\n", _INDIGO)
         self._append_plain(f"  {lane} lane  |  effort: {effort}\n\n", _TEXT_SEC)
 
-        self.process.start(_VENV_PYTHON, args)
-
         self.goal_input.clear()
         self.goal_input.setEnabled(False)
         self.send_btn.hide()
@@ -1126,18 +1138,30 @@ class OrbitWindow(QMainWindow):
         self._set_status("running")
 
     def _stop_task(self) -> None:
-        if self.process:
-            self.process.kill()
+        if self._worker and self._task_running:
             self._append_plain("\n[task stopped by user]\n", _RED_TEXT)
+            # Kill the worker; _worker_exited fires via the finished signal
+            # and calls _task_done so the UI is restored exactly once.
+            self._worker.kill()
+
+    _TASK_DONE_RE = re.compile(r"\[TASK:DONE (\d+)\]")
 
     def _read_stdout(self) -> None:
-        if not self.process:
+        if not self._worker:
             return
-        data = self.process.readAllStandardOutput()
+        data = self._worker.readAllStandardOutput()
         text = bytes(data).decode("utf-8", errors="replace")
-        self._raw_buffer += text
         for line in text.splitlines(keepends=True):
             stripped = line.strip()
+
+            # Warm-worker sentinel: task finished, restore UI without exiting.
+            # Do NOT accumulate this line into _raw_buffer.
+            done_m = self._TASK_DONE_RE.search(stripped)
+            if done_m:
+                self._task_done(int(done_m.group(1)))
+                continue
+
+            self._raw_buffer += line
 
             step_m = self._STEP_RE.match(stripped)
             if step_m:
@@ -1174,9 +1198,9 @@ class OrbitWindow(QMainWindow):
             self.output_text.ensureCursorVisible()
 
     def _read_stderr(self) -> None:
-        if not self.process:
+        if not self._worker:
             return
-        data = self.process.readAllStandardError()
+        data = self._worker.readAllStandardError()
         text = bytes(data).decode("utf-8", errors="replace")
         for line in text.splitlines(keepends=True):
             if any(noise in line for noise in self._STDERR_NOISE):
@@ -1184,8 +1208,14 @@ class OrbitWindow(QMainWindow):
             if line.strip():
                 self._append_plain(line, _RED_TEXT)
 
-    def _task_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
-        self.process = None
+    def _task_done(self, exit_code: int) -> None:
+        """Restore the UI after a task completes (normal finish or kill).
+        Called from _read_stdout when [TASK:DONE] arrives, or from
+        _worker_exited when the process exits unexpectedly."""
+        if not self._task_running:
+            return  # guard against duplicate calls
+        self._task_running = False
+
         for s in self.step_tracker.steps:
             if s.status == StepStatus.RUNNING:
                 s.status = StepStatus.DONE if exit_code == 0 else StepStatus.FAILED
@@ -1206,6 +1236,13 @@ class OrbitWindow(QMainWindow):
             self.wb_status_dot.setStyleSheet(f"color:{_RED};font-size:12px;")
         self._refresh_data()
         self.goal_input.setFocus()
+
+    def _worker_exited(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        """Worker process exited (crash or explicit kill). Clean up and let
+        the next _submit_task respawn it via _ensure_worker."""
+        self._worker = None
+        if self._task_running:
+            self._task_done(exit_code)
 
     def _render_final_output(self, exit_code: int) -> None:
         header_html = (

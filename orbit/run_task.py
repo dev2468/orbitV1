@@ -6,6 +6,7 @@ in this session actually work as a system, not just in isolation.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from typing import Any
@@ -116,6 +117,45 @@ async def _run_and_print(goal: str, *, lane: str) -> dict[str, Any]:
     return outcome
 
 
+async def _serve() -> None:
+    """Warm-worker mode for the GUI dashboard.
+
+    Reads one JSON line per task from stdin:
+        {"goal": "...", "lane": "headless|foreground", "effort": "low|medium|high"}
+
+    Runs each goal through the same run_task() call the REPL and one-shot
+    CLI use, then emits [TASK:DONE exit_code] so the GUI knows when the
+    task finished without waiting for the process to exit.
+
+    The process stays alive between tasks — imports and the event loop pay
+    their cost once. MCP server subprocesses still restart per task (the
+    Playwright Chrome lock prevents sharing them).
+    """
+    while True:
+        try:
+            line = await asyncio.to_thread(sys.stdin.readline)
+        except Exception:
+            break
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            goal = req.get("goal", "").strip()
+            lane = req.get("lane", "headless")
+            effort = req.get("effort", "medium")
+        except json.JSONDecodeError:
+            continue
+        if not goal:
+            continue
+        os.environ["ORBIT_EFFORT"] = effort
+        outcome = await _run_and_print(goal, lane=lane)
+        exit_code = 0 if outcome["status"] == "COMPLETED" else 1
+        print(f"[TASK:DONE {exit_code}]", flush=True)
+
+
 async def _repl() -> None:
     """The interactive entry point now that voice is gone: a persistent
     loop, not a fresh process per task. Each typed line becomes exactly
@@ -183,6 +223,10 @@ def _main() -> int:
     # existed — this is additive, not a behavior change for existing
     # callers. Stripped out of argv before the rest is joined into the
     # goal string so it doesn't leak into the task title/goal text.
+    if "--serve" in sys.argv[1:]:
+        asyncio.run(_serve())
+        return 0
+
     args = [a for a in sys.argv[1:] if a != "--foreground"]
     foreground = "--foreground" in sys.argv[1:]
     lane = "foreground" if foreground else "headless"
