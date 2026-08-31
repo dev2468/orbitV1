@@ -66,12 +66,12 @@ KNOWN_MODELS = {
         "Gemini 2.5 Flash via OpenRouter. Previous gen, cheaper, "
         "1M context. Good fallback."
     ),
-    "openrouter/anthropic/claude-sonnet-4": (
-        "Claude Sonnet 4 via OpenRouter. Best reasoning and instruction "
+    "openrouter/anthropic/claude-sonnet-4-5": (
+        "Claude Sonnet 4.5 via OpenRouter. Strong reasoning and instruction "
         "following. 200K context."
     ),
-    "openrouter/anthropic/claude-haiku-3.5": (
-        "Claude Haiku 3.5 via OpenRouter. Fastest Claude model. "
+    "openrouter/anthropic/claude-haiku-4-5": (
+        "Claude Haiku 4.5 via OpenRouter. Fastest Claude model. "
         "Good for simple/fast tasks."
     ),
     "openrouter/deepseek/deepseek-r1": (

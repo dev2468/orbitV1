@@ -8,7 +8,7 @@ def test_history_view_full():
     
     # Create sample task in db
     task_id = db.create_task("Open GitHub in Chrome", lane="foreground")
-    db.complete_task(task_id, result="Success! Commit checked.")
+    db.update_task_status(task_id, "COMPLETED", result="Success! Commit checked.")
 
     hv = TaskHistoryView(md_renderer=lambda x: f"<p>{x}</p>")
     hv.show()
