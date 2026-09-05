@@ -30,9 +30,15 @@ def test_step_elapsed_formatting():
     s = Step(description="Test step", status=StepStatus.RUNNING, started_at=now - 15, finished_at=now)
     assert s.elapsed() == "15s"
 
-    # Over 60s
+    # Over 60s — compact "1m23s", matching gui.stats.format_duration so the
+    # step rail and the History view never render the same span two ways.
     s = Step(description="Test step", status=StepStatus.DONE, started_at=now - 83, finished_at=now)
-    assert s.elapsed() == "1m 23s"
+    assert s.elapsed() == "1m23s"
+
+    # Under 10s keeps one decimal: at that scale "2s" vs "2.9s" is the
+    # difference between a step feeling instant and feeling sluggish.
+    s = Step(description="Test step", status=StepStatus.DONE, started_at=now - 2.1, finished_at=now)
+    assert s.elapsed() == "2.1s"
 
     # Active running step (finished_at is None)
     s = Step(description="Test step", status=StepStatus.RUNNING, started_at=now - 5)
@@ -87,7 +93,12 @@ def test_step_tracker_start_and_auto_completion(qapp):
     assert tracker.steps[0].description == "Opening Word document"
     assert tracker.steps[0].status == StepStatus.RUNNING
     assert tracker.steps[0].started_at is not None
-    assert tracker.isVisible()
+    # The rail is a permanent sidebar, so it no longer shows/hides itself —
+    # what changes is which of its two panes is up. Asserting on the tracker's
+    # own isVisible() would only report whether a parent window happens to be
+    # shown, which is not what this test is about.
+    assert tracker.placeholder.isHidden()
+    assert not tracker.scroll_area.isHidden()
 
     # Start Step 2 -> Step 1 should auto-complete to DONE
     tracker.handle_marker("START", "Writing cipher code")
@@ -132,7 +143,10 @@ def test_step_tracker_reset(qapp):
     tracker.reset()
     assert len(tracker.steps) == 0
     assert len(tracker._step_widgets) == 0
-    assert tracker.isHidden()
+    # reset() returns the rail to its placeholder rather than hiding it: the
+    # sidebar must keep its width so the output pane beside it never reflows.
+    assert not tracker.placeholder.isHidden()
+    assert tracker.scroll_area.isHidden()
 
 
 def test_tool_call_fallback(qapp):

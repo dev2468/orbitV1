@@ -1,6 +1,34 @@
-"""Orbit unified GUI — chat-centered task submission with live output,
-sleek light-mode design, Indigo accents, foreground/headless toggle,
-Gemini effort selector, full-window task history inspector, and slide-out approvals.
+"""Orbit unified GUI — Studio (warm / organic) direction.
+
+Layout, top to bottom: a 48px nav bar (brand, Workbench/History switcher,
+approvals bell), the page stack, and a 28px status bar. The Workbench page is
+two columns — a reading column carrying the input card, quick chips and the
+output pane, and a fixed 220px step rail on the right (see
+``gui/step_tracker.py`` for why progress lives out there).
+
+## Overlays are children of the central widget, not dialogs
+
+The voice modal and the approvals drawer are both plain widgets reparented
+onto ``central`` and ``raise_()``d, each behind its own scrim. Neither is a
+QDialog, and that is deliberate on both counts:
+
+* the voice modal must not take the keyboard, because F9 has to keep reaching
+  the app's native event filter to stop the recording it started;
+* the drawer used to animate a layout width, which reflowed the entire
+  workbench beside it on every frame. As an overlay it composites over a
+  static page instead.
+
+Both are positioned manually from :meth:`OrbitWindow._layout_overlays`, called
+from ``resizeEvent`` and whenever one is shown.
+
+## Task submission still spawns nothing per task
+
+The warm worker (``orbit.run_task --serve``) is spawned once at first submit
+and fed one JSON line per goal; ``[TASK:DONE n]`` on stdout ends a task
+without ending the process. That contract is unchanged by this redesign —
+see ``_ensure_worker``. The standing rule that this process never writes task
+or event rows to orbit.db is likewise unchanged; the approvals card remains
+the single, deliberate exception (``gui/CLAUDE.md``).
 """
 
 from __future__ import annotations
@@ -17,43 +45,35 @@ if _PROJECT_ROOT not in sys.path:
 
 from PySide6.QtCore import (
     QEasingCurve,
+    QPoint,
     QProcess,
     QPropertyAnimation,
     QRect,
-    QSize,
     Qt,
     QTimer,
 )
 from PySide6.QtGui import (
     QColor,
-    QFont,
-    QIcon,
+    QGuiApplication,
     QPainter,
     QPen,
     QPixmap,
-    QCursor,
-    QGuiApplication,
+    QShortcut,
+    QKeySequence,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFrame,
-    QGraphicsDropShadowEffect,
-    QGraphicsOpacityEffect,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QProgressBar,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
-    QSplitter,
     QStackedWidget,
     QStatusBar,
-    QTableWidget,
-    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -61,387 +81,22 @@ from PySide6.QtWidgets import (
 
 from orbit import db
 from orbit.policy import load_windows_control_policy
+from gui import theme
+from gui.stats import format_duration
 from gui.step_tracker import StepTracker, StepStatus
 from gui.history_view import TaskHistoryView
-from gui.voice import HotkeyFilter, OrbWidget, VoiceController
+from gui.voice import HotkeyFilter, ScrimWidget, VoiceController, VoiceModal
 
 _VENV_PYTHON = str(Path(_PROJECT_ROOT) / "venv" / "Scripts" / "python.exe")
 
-# -- palette (Modern Sleek Light Mode) ----------------------------------------
-
-_INDIGO = "#4F46E5"
-_INDIGO_DARK = "#4338CA"
-_INDIGO_LIGHT = "#EEF2FF"
-_INDIGO_BORDER = "#C7D2FE"
-_INDIGO_50 = "#E0E7FF"
-_INDIGO_TEXT = "#3730A3"
-
-_WHITE = "#FFFFFF"
-_BG = "#F7F8FA"
-_BG_CARD = "#FFFFFF"
-_TEXT = "#111827"
-_TEXT_SEC = "#6B7280"
-_TEXT_MUTED = "#9CA3AF"
-_BORDER = "#E5E7EB"
-_BORDER_LIGHT = "#F3F4F6"
-
-_GREEN = "#10B981"
-_GREEN_LIGHT = "#ECFDF5"
-_GREEN_BORDER = "#A7F3D0"
-_GREEN_TEXT = "#047857"
-
-_RED = "#EF4444"
-_RED_LIGHT = "#FEF2F2"
-_RED_BORDER = "#FECACA"
-_RED_TEXT = "#B91C1C"
-
-_AMBER = "#F59E0B"
-_AMBER_LIGHT = "#FFFBEB"
-_AMBER_BORDER = "#FDE68A"
-_AMBER_TEXT = "#B45309"
-
-_GRAY = "#6B7280"
-_GRAY_LIGHT = "#F3F4F6"
-_GRAY_BORDER = "#E5E7EB"
-
-# -- stylesheet ---------------------------------------------------------------
-
-STYLESHEET = f"""
-QMainWindow, QWidget {{
-    background-color: {_BG};
-    color: {_TEXT};
-    font-family: "Segoe UI Variable", "Segoe UI", "Inter", -apple-system, sans-serif;
-    font-size: 13px;
-}}
-QMainWindow {{
-    background-color: {_BG};
-}}
-
-/* ---- header brand & buttons ---- */
-#appLogo {{
-    font-size: 24px;
-    font-weight: 800;
-    color: {_INDIGO};
-    letter-spacing: -0.6px;
-}}
-#appTagline {{
-    font-size: 11px;
-    font-weight: 600;
-    color: {_TEXT_SEC};
-    background: {_WHITE};
-    border: 1px solid {_BORDER};
-    border-radius: 6px;
-    padding: 3px 8px;
-}}
-
-/* ---- Navigation Switcher ---- */
-#navSwitcher {{
-    background: {_GRAY_LIGHT};
-    border: 1px solid {_BORDER};
-    border-radius: 10px;
-    padding: 3px;
-}}
-.navTabBtn {{
-    border: none;
-    border-radius: 8px;
-    padding: 6px 16px;
-    font-size: 12px;
-    font-weight: 600;
-    color: {_TEXT_SEC};
-    background: transparent;
-}}
-.navTabBtn:hover {{
-    color: {_TEXT};
-}}
-.navTabBtnActive {{
-    border: none;
-    border-radius: 8px;
-    padding: 6px 16px;
-    font-size: 12px;
-    font-weight: 700;
-    color: {_WHITE};
-    background: {_INDIGO};
-}}
-
-/* ---- Alert & Aux Buttons ---- */
-.navBtn {{
-    border: 1px solid {_BORDER};
-    border-radius: 16px;
-    background: {_WHITE};
-    padding: 5px 14px;
-    font-size: 12px;
-    font-weight: 600;
-    color: {_TEXT_SEC};
-}}
-.navBtn:hover {{
-    background: {_BG};
-    color: {_TEXT};
-    border-color: {_TEXT_SEC};
-}}
-.navBtnActive {{
-    border: 1px solid {_INDIGO_BORDER};
-    border-radius: 16px;
-    background: {_INDIGO_LIGHT};
-    padding: 5px 14px;
-    font-size: 12px;
-    font-weight: 700;
-    color: {_INDIGO};
-}}
-.navBtnAlert {{
-    border: 1px solid {_AMBER_BORDER};
-    border-radius: 16px;
-    background: {_AMBER_LIGHT};
-    padding: 5px 14px;
-    font-size: 12px;
-    font-weight: 700;
-    color: {_AMBER_TEXT};
-}}
-.navBtnAlert:hover {{
-    background: #FEF3C7;
-}}
-
-/* ---- input card ---- */
-#inputCard {{
-    background: {_WHITE};
-    border: 1.5px solid {_BORDER};
-    border-radius: 14px;
-    padding: 4px 8px 4px 14px;
-}}
-#inputCard:focus-within {{
-    border-color: {_INDIGO};
-}}
-#goalInput {{
-    border: none;
-    background: transparent;
-    font-size: 14px;
-    color: {_TEXT};
-    padding: 8px 4px;
-}}
-#goalInput:focus {{
-    border: none;
-    outline: none;
-}}
-
-/* ---- toggle pills ---- */
-#toggleFrame {{
-    background: {_GRAY_LIGHT};
-    border: 1px solid {_BORDER};
-    border-radius: 10px;
-    padding: 3px;
-}}
-.toggleBtn {{
-    border: none;
-    border-radius: 7px;
-    padding: 5px 14px;
-    font-size: 12px;
-    font-weight: 600;
-    color: {_TEXT_SEC};
-    background: transparent;
-}}
-.toggleBtn:hover {{
-    color: {_TEXT};
-}}
-.toggleBtnActive {{
-    border: none;
-    border-radius: 7px;
-    padding: 5px 14px;
-    font-size: 12px;
-    font-weight: 700;
-    color: {_WHITE};
-    background: {_INDIGO};
-}}
-
-/* ---- effort combo ---- */
-#effortCombo {{
-    border: 1px solid {_BORDER};
-    border-radius: 8px;
-    padding: 5px 24px 5px 10px;
-    background: {_WHITE};
-    font-size: 12px;
-    font-weight: 600;
-    color: {_TEXT_SEC};
-    min-width: 85px;
-}}
-#effortCombo::drop-down {{
-    border: none;
-    width: 20px;
-}}
-#effortCombo QAbstractItemView {{
-    background: {_WHITE};
-    border: 1px solid {_BORDER};
-    selection-background-color: {_INDIGO_LIGHT};
-    selection-color: {_INDIGO};
-}}
-
-/* ---- send / stop buttons ---- */
-#sendBtn {{
-    background-color: {_INDIGO};
-    color: white;
-    border: none;
-    border-radius: 10px;
-    padding: 8px 24px;
-    font-size: 13px;
-    font-weight: 700;
-}}
-#sendBtn:hover {{ background-color: {_INDIGO_DARK}; }}
-#sendBtn:pressed {{ background-color: #3730A3; }}
-#sendBtn:disabled {{ background-color: {_TEXT_MUTED}; }}
-
-#stopBtn {{
-    background-color: {_RED};
-    color: white;
-    border: none;
-    border-radius: 10px;
-    padding: 8px 20px;
-    font-size: 13px;
-    font-weight: 700;
-}}
-#stopBtn:hover {{ background-color: #DC2626; }}
-
-#micBtn {{
-    background-color: {_BG_CARD};
-    border: 1.5px solid {_BORDER};
-    border-radius: 18px;
-    font-size: 16px;
-    padding: 0px;
-}}
-#micBtn:hover {{ background-color: {_INDIGO_LIGHT}; border-color: {_INDIGO}; }}
-#micBtn:pressed {{ background-color: {_INDIGO}; color: white; }}
-
-/* ---- floating approval banner ---- */
-#approvalBanner {{
-    background: {_AMBER_LIGHT};
-    border: 1px solid {_AMBER_BORDER};
-    border-radius: 12px;
-    padding: 10px 16px;
-}}
-#approvalBannerText {{
-    font-weight: 700;
-    font-size: 13px;
-    color: {_AMBER_TEXT};
-}}
-#bannerReviewBtn {{
-    background: {_AMBER};
-    color: white;
-    font-weight: 700;
-    border: none;
-    border-radius: 6px;
-    padding: 5px 14px;
-    font-size: 12px;
-}}
-#bannerReviewBtn:hover {{
-    background: #D97706;
-}}
-
-/* ---- output workbench panel ---- */
-#outputWorkbench {{
-    background: {_WHITE};
-    border: 1px solid {_BORDER};
-    border-radius: 14px;
-}}
-#workbenchHeader {{
-    background: {_WHITE};
-    border-bottom: 1px solid {_BORDER_LIGHT};
-    border-top-left-radius: 14px;
-    border-top-right-radius: 14px;
-    padding: 8px 16px;
-}}
-#outputText {{
-    background: {_WHITE};
-    border: none;
-    border-bottom-left-radius: 14px;
-    border-bottom-right-radius: 14px;
-    font-family: "Cascadia Code", "Consolas", "JetBrains Mono", monospace;
-    font-size: 13px;
-    color: {_TEXT};
-    padding: 16px;
-    selection-background-color: {_INDIGO_50};
-}}
-.toolBtn {{
-    border: 1px solid {_BORDER};
-    border-radius: 6px;
-    background: {_WHITE};
-    padding: 4px 10px;
-    font-size: 11px;
-    font-weight: 600;
-    color: {_TEXT_SEC};
-}}
-.toolBtn:hover {{
-    background: {_BG};
-    color: {_TEXT};
-}}
-
-/* ---- drawer & approvals card ---- */
-#drawerContainer {{
-    background: {_WHITE};
-    border-left: 1px solid {_BORDER};
-}}
-#drawerHeader {{
-    border-bottom: 1px solid {_BORDER_LIGHT};
-    padding: 14px 18px;
-}}
-#drawerTitle {{
-    font-size: 15px;
-    font-weight: 700;
-    color: {_TEXT};
-}}
-#drawerCloseBtn {{
-    border: none;
-    background: transparent;
-    color: {_TEXT_SEC};
-    font-size: 16px;
-    font-weight: 700;
-    padding: 2px 6px;
-}}
-#drawerCloseBtn:hover {{
-    color: {_RED};
-}}
-#confirmDrawerCard {{
-    background: {_WHITE};
-    border: 1px solid {_BORDER};
-    border-radius: 12px;
-    padding: 14px;
-}}
-#approveBtn {{
-    background-color: {_GREEN}; color: white; border: none;
-    border-radius: 8px; padding: 9px 20px; font-weight: 700; font-size: 13px;
-}}
-#approveBtn:hover {{ background-color: #059669; }}
-#approveBtn:disabled {{ background-color: {_TEXT_MUTED}; }}
-#rejectBtn {{
-    background-color: {_RED}; color: white; border: none;
-    border-radius: 8px; padding: 9px 20px; font-weight: 700; font-size: 13px;
-}}
-#rejectBtn:hover {{ background-color: #DC2626; }}
-#rejectBtn:disabled {{ background-color: {_TEXT_MUTED}; }}
-
-/* ---- status bar ---- */
-QStatusBar {{
-    background: {_WHITE};
-    border-top: 1px solid {_BORDER};
-    color: {_TEXT_SEC};
-    font-size: 12px;
-    padding: 4px 12px;
-}}
-#statusDot {{ font-size: 10px; }}
-
-/* ---- progress bar ---- */
-#progressBar {{
-    border: none; background: {_BORDER}; border-radius: 2px; max-height: 3px;
-}}
-#progressBar::chunk {{ background: {_INDIGO}; border-radius: 2px; }}
-
-/* ---- scrollbar ---- */
-QScrollBar:vertical {{
-    background: transparent; width: 8px; margin: 0;
-}}
-QScrollBar::handle:vertical {{
-    background: {_BORDER}; border-radius: 4px; min-height: 30px;
-}}
-QScrollBar::handle:vertical:hover {{ background: {_TEXT_MUTED}; }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
-"""
+# Starter prompts offered under the input when the workbench is idle. Each is
+# a full goal, not a category label — clicking one should be runnable as-is.
+_QUICK_CHIPS = [
+    ("Search for flights", "Find the cheapest round-trip flights from Delhi to Goa next weekend"),
+    ("Draft an email", "Draft a polite follow-up email to a client who hasn't replied in a week"),
+    ("Summarize a PDF", "Summarize the key points of the most recent PDF in my Downloads folder"),
+    ("Research a product", "Compare the top 3 mechanical keyboards under 5000 rupees and recommend one"),
+]
 
 
 # -- markdown to HTML ---------------------------------------------------------
@@ -451,7 +106,7 @@ def _md_to_html(text: str) -> str:
     html_parts: list[str] = []
     in_table = False
     in_list = False
-    table_rows: list[str] = []
+    table_rows: list[list[str]] = []
     i = 0
 
     while i < len(lines):
@@ -465,11 +120,12 @@ def _md_to_html(text: str) -> str:
             alt, src = img_match.group(1), img_match.group(2).replace("\\", "/")
             html_parts.append(
                 f'<div style="margin:12px 0;"><img src="file:///{src}" alt="{alt}" '
-                f'style="max-width:100%;border:1px solid {_BORDER};border-radius:10px;box-shadow: 0 4px 6px -1px rgba(0,0,0,0.06);">'
+                f'style="max-width:100%;border:1px solid {theme.BORDER};border-radius:14px;">'
             )
             if alt:
                 html_parts.append(
-                    f'<p style="color:{_TEXT_SEC};font-size:11px;margin:4px 0 12px 0;font-style:italic;">{alt}</p>'
+                    f'<p style="color:{theme.TEXT_TERTIARY};font-size:11px;margin:4px 0 12px 0;'
+                    f'font-style:italic;">{alt}</p>'
                 )
             html_parts.append('</div>')
             i += 1; continue
@@ -477,17 +133,21 @@ def _md_to_html(text: str) -> str:
         if stripped.startswith("screenshot_path:") or stripped.startswith("[screenshot:"):
             if in_list:
                 html_parts.append("</ul>"); in_list = False
-            path = re.sub(r"^(?:screenshot_path:\s*|^\[screenshot:\s*|\]$)", "", stripped).strip().rstrip("]").replace("\\", "/")
+            path = re.sub(
+                r"^(?:screenshot_path:\s*|^\[screenshot:\s*|\]$)", "", stripped
+            ).strip().rstrip("]").replace("\\", "/")
             html_parts.append(
                 f'<div style="margin:12px 0;"><img src="file:///{path}" '
-                f'style="max-width:100%;border:1px solid {_BORDER};border-radius:10px;box-shadow: 0 4px 6px -1px rgba(0,0,0,0.06);"></div>'
+                f'style="max-width:100%;border:1px solid {theme.BORDER};border-radius:14px;"></div>'
             )
             i += 1; continue
 
         if re.match(r"^-{4,}$", stripped):
             if in_list:
                 html_parts.append("</ul>"); in_list = False
-            html_parts.append(f'<hr style="border:none;border-top:1px solid {_BORDER_LIGHT};margin:14px 0;">')
+            html_parts.append(
+                f'<hr style="border:none;border-top:1px solid {theme.BORDER_LIGHT};margin:14px 0;">'
+            )
             i += 1; continue
 
         if "|" in stripped and stripped.startswith("|") and stripped.endswith("|"):
@@ -511,7 +171,7 @@ def _md_to_html(text: str) -> str:
             sizes = {1: "18px", 2: "16px", 3: "14px", 4: "13px"}
             html_parts.append(
                 f'<p style="font-size:{sizes.get(level,"14px")};font-weight:700;'
-                f'color:{_TEXT};margin:14px 0 6px 0;">{_inline_md(m.group(2))}</p>'
+                f'color:{theme.TEXT_PRIMARY};margin:14px 0 6px 0;">{_inline_md(m.group(2))}</p>'
             )
             i += 1; continue
 
@@ -519,7 +179,9 @@ def _md_to_html(text: str) -> str:
         if m:
             if not in_list:
                 in_list = True
-                html_parts.append(f'<ul style="margin:4px 0 4px 18px;padding:0;color:{_TEXT};">')
+                html_parts.append(
+                    f'<ul style="margin:4px 0 4px 18px;padding:0;color:{theme.TEXT_PRIMARY};">'
+                )
             html_parts.append(f'<li style="margin:3px 0;">{_inline_md(m.group(1))}</li>')
             i += 1; continue
 
@@ -530,7 +192,8 @@ def _md_to_html(text: str) -> str:
             html_parts.append("<br>"); i += 1; continue
 
         html_parts.append(
-            f'<p style="margin:4px 0;color:{_TEXT};line-height:1.6;">{_inline_md(stripped)}</p>'
+            f'<p style="margin:4px 0;color:{theme.TEXT_PRIMARY};line-height:1.7;">'
+            f'{_inline_md(stripped)}</p>'
         )
         i += 1
 
@@ -544,16 +207,19 @@ def _md_to_html(text: str) -> str:
 def _build_table(rows: list[list[str]]) -> str:
     if not rows:
         return ""
-    html = f'<table style="border-collapse:collapse;width:100%;margin:10px 0;font-size:12px;border: 1px solid {_BORDER};border-radius:8px;">'
+    html = (
+        f'<table style="border-collapse:collapse;width:100%;margin:10px 0;font-size:12px;'
+        f'border:1px solid {theme.BORDER};border-radius:8px;">'
+    )
     for idx, row in enumerate(rows):
         tag = "th" if idx == 0 else "td"
-        bg = _INDIGO_LIGHT if idx == 0 else (_BG if idx % 2 == 0 else _WHITE)
+        bg = theme.INPUT_BG if idx == 0 else (theme.BG_CANVAS if idx % 2 == 0 else theme.SURFACE)
         weight = "700" if idx == 0 else "400"
-        color = _INDIGO_TEXT if idx == 0 else _TEXT
+        color = theme.TEXT_PRIMARY if idx == 0 else theme.TEXT_PRIMARY
         html += "<tr>"
         for cell in row:
             html += (
-                f'<{tag} style="padding:8px 12px;border-bottom:1px solid {_BORDER};'
+                f'<{tag} style="padding:8px 12px;border-bottom:1px solid {theme.BORDER};'
                 f'background:{bg};font-weight:{weight};color:{color};text-align:left;">'
                 f'{_inline_md(cell)}</{tag}>'
             )
@@ -564,53 +230,117 @@ def _build_table(rows: list[list[str]]) -> str:
 
 def _inline_md(text: str) -> str:
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    text = re.sub(r"\*\*(.+?)\*\*", rf'<b style="color:{_TEXT};font-weight:700;">\1</b>', text)
+    text = re.sub(
+        r"\*\*(.+?)\*\*",
+        rf'<b style="color:{theme.TEXT_PRIMARY};font-weight:700;">\1</b>',
+        text,
+    )
     text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
     text = re.sub(
         r"`(.+?)`",
-        rf'<code style="background:{_BG};padding:2px 6px;border-radius:4px;border:1px solid {_BORDER};'
-        rf'font-size:12px;color:{_INDIGO_TEXT};font-weight:600;">\1</code>',
+        rf'<code style="background:{theme.INPUT_BG};padding:2px 6px;border-radius:4px;'
+        rf'border:1px solid {theme.BORDER};font-size:12px;color:{theme.ACCENT_PRESSED};'
+        rf'font-weight:600;">\1</code>',
         text,
     )
     return text
 
 
-# -- toggle button helper -----------------------------------------------------
+# -- small painted pieces -----------------------------------------------------
 
-class ToggleGroup(QWidget):
-    """Pill-shaped segmented toggle (Headless / Foreground)."""
+class LogoMark(QWidget):
+    """The Orbit glyph: an indigo disc with a punched-out ring.
 
-    def __init__(self, options: list[str], default: int = 0) -> None:
+    Painted rather than shipped as an icon file so it stays crisp at any DPI
+    and picks up the theme accent without a second asset to keep in sync.
+    """
+
+    def __init__(self, size: int = 18, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._size = size
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        s = self._size
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(theme.ACCENT))
+        p.drawEllipse(0, 0, s, s)
+        # Ring: draw the surface color as an annulus via two circles.
+        p.setBrush(QColor(theme.SURFACE))
+        r2 = s * 0.45
+        p.drawEllipse(int((s - r2) / 2), int((s - r2) / 2), int(r2), int(r2))
+        p.setBrush(QColor(theme.ACCENT))
+        r3 = s * 0.20
+        p.drawEllipse(int((s - r3) / 2), int((s - r3) / 2), int(r3), int(r3))
+        p.end()
+
+
+class SegmentedToggle(QFrame):
+    """Pill-shaped segmented control (Headless / Foreground, Workbench / History).
+
+    A QFrame with an id selector, not a bare QWidget: a plain QWidget ignores
+    a QSS ``background`` unless WA_StyledBackground is set, so the track would
+    render invisible and leave the buttons floating.
+    """
+
+    def __init__(
+        self,
+        options: list[str],
+        default: int = 0,
+        *,
+        compact: bool = False,
+        on_change=None,
+    ) -> None:
         super().__init__()
-        self.setObjectName("toggleFrame")
         self._buttons: list[QPushButton] = []
         self._selected = default
+        self._compact = compact
+        self._on_change = on_change
+
+        self.setObjectName("segTrack")
+        self.setStyleSheet(
+            f"#segTrack {{ background:{theme.INPUT_BG};"
+            f" border:none; border-radius:{10 if compact else 14}px; }}"
+        )
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(3, 3, 3, 3)
+        pad = 2 if compact else 3
+        lay.setContentsMargins(pad, pad, pad, pad)
         lay.setSpacing(2)
         for idx, label in enumerate(options):
             btn = QPushButton(label)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _, i=idx: self._select(i))
+            btn.setFlat(True)
+            btn.clicked.connect(lambda _=False, i=idx: self._select(i))
             self._buttons.append(btn)
             lay.addWidget(btn)
         self._apply_styles()
 
     def _select(self, idx: int) -> None:
+        if idx == self._selected:
+            return
         self._selected = idx
         self._apply_styles()
+        if self._on_change:
+            self._on_change(self.value())
 
     def _apply_styles(self) -> None:
+        if self._compact:
+            pad, fs, radius = "4px 14px", "12px", 8
+        else:
+            pad, fs, radius = "7px 20px", "13px", 12
         for i, btn in enumerate(self._buttons):
             if i == self._selected:
                 btn.setStyleSheet(
-                    f"border:none;border-radius:7px;padding:5px 14px;font-size:12px;font-weight:700;"
-                    f"color:{_WHITE};background:{_INDIGO};"
+                    f"border:none;border-radius:{radius}px;padding:{pad};font-size:{fs};"
+                    f"font-weight:600;color:{theme.TEXT_PRIMARY};background:{theme.SURFACE};"
                 )
             else:
                 btn.setStyleSheet(
-                    f"border:none;border-radius:7px;padding:5px 14px;font-size:12px;font-weight:600;"
-                    f"color:{_TEXT_SEC};background:transparent;"
+                    f"border:none;border-radius:{radius}px;padding:{pad};font-size:{fs};"
+                    f"font-weight:500;color:{theme.TEXT_TERTIARY};background:transparent;"
                 )
 
     def value(self) -> str:
@@ -622,6 +352,125 @@ class ToggleGroup(QWidget):
                 self._select(i)
                 break
 
+    def set_index(self, idx: int) -> None:
+        self._select(idx)
+
+
+class BellButton(QPushButton):
+    """Approvals bell with a count badge painted into the corner.
+
+    The badge is painted rather than being a child QLabel so it can overhang
+    the button's rounded corner without the parent clipping it.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._count = 0
+        self.setFixedSize(36, 36)
+        self.setCursor(Qt.PointingHandCursor)
+        self._apply_style()
+
+    def set_count(self, count: int) -> None:
+        if count == self._count:
+            return
+        self._count = count
+        self._apply_style()
+        self.update()
+
+    def _apply_style(self) -> None:
+        if self._count:
+            self.setStyleSheet(
+                f"QPushButton {{ background:{theme.WARNING_BG};"
+                f" border:1px solid {theme.WARNING_BORDER};"
+                f" border-radius:{theme.RADIUS_MD}px; }}"
+                f"QPushButton:hover {{ background:#FFEDD5; }}"
+            )
+            self.setToolTip(f"{self._count} action(s) awaiting approval")
+        else:
+            self.setStyleSheet(
+                f"QPushButton {{ background:{theme.INPUT_BG}; border:none;"
+                f" border-radius:{theme.RADIUS_MD}px; }}"
+                f"QPushButton:hover {{ background:{theme.BORDER}; }}"
+            )
+            self.setToolTip("No pending approvals")
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        stroke = QColor(theme.WARNING if self._count else theme.TEXT_TERTIARY)
+        p.setPen(QPen(stroke, 1.8))
+        p.setBrush(Qt.NoBrush)
+        # Bell: a dome plus a base line plus a clapper arc.
+        p.drawArc(QRect(11, 10, 14, 14), 0, 180 * 16)
+        p.drawLine(11, 17, 11, 22)
+        p.drawLine(25, 17, 25, 22)
+        p.drawLine(9, 23, 27, 23)
+        p.drawArc(QRect(15, 24, 6, 4), 180 * 16, 180 * 16)
+
+        if self._count:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(theme.SURFACE))
+            p.drawEllipse(23, 1, 14, 14)
+            p.setBrush(QColor(theme.WARNING))
+            p.drawEllipse(24, 2, 12, 12)
+            p.setPen(QColor("#FFFFFF"))
+            f = p.font()
+            f.setPointSizeF(6.5)
+            f.setBold(True)
+            p.setFont(f)
+            label = "9+" if self._count > 9 else str(self._count)
+            p.drawText(QRect(24, 2, 12, 12), Qt.AlignCenter, label)
+        p.end()
+
+
+class EmptyState(QWidget):
+    """Idle workbench: concentric ring glyph over two lines of copy."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignCenter)
+        lay.setSpacing(12)
+
+        glyph = _RingGlyph()
+        lay.addWidget(glyph, alignment=Qt.AlignHCenter)
+
+        title = QLabel("Ready for your next task")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(
+            f"font-size:15px;font-weight:500;color:{theme.TEXT_SECONDARY};background:transparent;"
+        )
+        lay.addWidget(title)
+
+        sub = QLabel("Type a goal or press F9 to speak")
+        sub.setAlignment(Qt.AlignCenter)
+        sub.setStyleSheet(
+            f"font-size:12px;color:{theme.TEXT_TERTIARY};background:transparent;"
+        )
+        lay.addWidget(sub)
+
+
+class _RingGlyph(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFixedSize(56, 56)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(theme.BORDER_INPUT), 1.5))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(4, 4, 48, 48)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(theme.ACCENT_LIGHT))
+        p.drawEllipse(18, 18, 20, 20)
+        p.setBrush(QColor(theme.ACCENT))
+        p.drawEllipse(24, 24, 8, 8)
+        p.end()
+
 
 # -- main window --------------------------------------------------------------
 
@@ -630,13 +479,11 @@ class OrbitWindow(QMainWindow):
         r"^\[STEP:(START|DONE|FAIL|PROGRESS)\]\s*(.+?)(?:\s*[—\-–]\s*(.+))?$",
         re.UNICODE,
     )
-    _TOOL_CALL_RE = re.compile(
-        r"""(?:^|[\s\[])tool_call:\s*([a-zA-Z0-9_]+)""",
-        re.IGNORECASE,
-    )
+    _TOOL_CALL_RE = re.compile(r"""(?:^|[\s\[])tool_call:\s*([a-zA-Z0-9_]+)""", re.IGNORECASE)
     _SCREENSHOT_RE = re.compile(
         r"""['"]?screenshot_path['"]?\s*[:=]\s*['"]?(.+?\.png)['"]?""", re.IGNORECASE
     )
+    _TASK_DONE_RE = re.compile(r"\[TASK:DONE (\d+)\]")
     _STDERR_NOISE = (
         "IncompleteFieldDefinitionWarning",
         "warnings.warn(",
@@ -651,10 +498,11 @@ class OrbitWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Orbit — Personal Task Agent")
         self.resize(1180, 800)
-        self.setMinimumSize(880, 600)
+        self.setMinimumSize(960, 640)
 
-        self._worker: QProcess | None = None      # persistent warm worker
-        self._task_running: bool = False           # True while a task is in flight
+        self._worker: QProcess | None = None
+        self._task_running = False
+        self._task_started_at: float | None = None
         self._voice_ctrl: VoiceController | None = None
         self._committed_text = ""
         self._raw_buffer = ""
@@ -662,405 +510,663 @@ class OrbitWindow(QMainWindow):
         self._auto_scroll = True
         self._drawer_open = False
         self._current_confirm_id: str | None = None
+        self._pending_count = 0
 
         central = QWidget()
-        root_h = QHBoxLayout(central)
-        root_h.setContentsMargins(0, 0, 0, 0)
-        root_h.setSpacing(0)
+        central.setStyleSheet(f"background: {theme.BG_CANVAS};")
+        self._central = central
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # ===================== MAIN CONTENT COLUMN =====================
-        main_col = QWidget()
-        main_layout = QVBoxLayout(main_col)
-        main_layout.setContentsMargins(28, 18, 28, 14)
-        main_layout.setSpacing(12)
+        root.addWidget(self._build_nav_bar())
 
-        # -- Top Navigation & Brand Header ------------------------------------
-        nav_bar = QHBoxLayout()
-        nav_bar.setSpacing(14)
+        self.main_stack = QStackedWidget()
+        self.main_stack.addWidget(self._build_workbench_page())
+
+        self.history_view = TaskHistoryView(md_renderer=_md_to_html)
+        self.history_view.rerun_requested.connect(self._handle_rerun_task)
+        self.main_stack.addWidget(self.history_view)
+
+        root.addWidget(self.main_stack, stretch=1)
+        self.setCentralWidget(central)
+
+        self._build_status_bar()
+        self._build_overlays()
+        self._setup_voice()
+        self._setup_shortcuts()
+
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self._refresh_data)
+        self.refresh_timer.start(2000)
+
+        self.elapsed_timer = QTimer(self)
+        self.elapsed_timer.timeout.connect(self._tick_status)
+        self.elapsed_timer.start(1000)
+
+        self._refresh_data()
+        self._set_status("idle")
+        self._show_workbench()
+
+    # ===================== construction =====================
+
+    def _build_nav_bar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("navBar")
+        bar.setFixedHeight(theme.NAV_HEIGHT)
+        bar.setStyleSheet(
+            f"#navBar {{ background:{theme.SURFACE};"
+            f" border-bottom:1px solid {theme.BORDER}; }}"
+        )
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(24, 0, 24, 0)
+        lay.setSpacing(0)
+
+        lay.addWidget(LogoMark(18))
+        lay.addSpacing(8)
 
         logo = QLabel("Orbit")
-        logo.setObjectName("appLogo")
-        nav_bar.addWidget(logo)
-
-        tagline = QLabel("Personal Task Agent")
-        tagline.setObjectName("appTagline")
-        nav_bar.addWidget(tagline)
-
-        nav_bar.addSpacing(10)
-
-        # Main Navigation Switcher (Workbench vs History)
-        self.nav_switcher = QFrame()
-        self.nav_switcher.setObjectName("navSwitcher")
-        ns_lay = QHBoxLayout(self.nav_switcher)
-        ns_lay.setContentsMargins(3, 3, 3, 3)
-        ns_lay.setSpacing(2)
-
-        self.tab_workbench_btn = QPushButton("⚡ Workbench")
-        self.tab_workbench_btn.setProperty("class", "navTabBtnActive")
-        self.tab_workbench_btn.setCursor(Qt.PointingHandCursor)
-        self.tab_workbench_btn.clicked.connect(self._show_workbench)
-        ns_lay.addWidget(self.tab_workbench_btn)
-
-        self.tab_history_btn = QPushButton("📜 History & Analytics")
-        self.tab_history_btn.setProperty("class", "navTabBtn")
-        self.tab_history_btn.setCursor(Qt.PointingHandCursor)
-        self.tab_history_btn.clicked.connect(self._show_history)
-        ns_lay.addWidget(self.tab_history_btn)
-
-        nav_bar.addWidget(self.nav_switcher)
-
-        nav_bar.addStretch()
-
-        # Approvals toggle button with counter badge
-        self.approvals_btn = QPushButton("Approvals (0)")
-        self.approvals_btn.setProperty("class", "navBtn")
-        self.approvals_btn.setCursor(Qt.PointingHandCursor)
-        self.approvals_btn.clicked.connect(self._toggle_approvals)
-        nav_bar.addWidget(self.approvals_btn)
-
-        main_layout.addLayout(nav_bar)
-
-        # ===================== MAIN PAGES (STACKED) =====================
-        self.main_stack = QStackedWidget()
-
-        # ----------------- PAGE 0: WORKBENCH VIEW -----------------
-        workbench_page = QWidget()
-        wb_page_lay = QVBoxLayout(workbench_page)
-        wb_page_lay.setContentsMargins(0, 4, 0, 0)
-        wb_page_lay.setSpacing(12)
-
-        # Controls Row: Lane toggle + Effort
-        controls_row = QHBoxLayout()
-        controls_row.setSpacing(14)
-
-        self.lane_toggle = ToggleGroup(["Headless", "Foreground"], default=0)
-        controls_row.addWidget(self.lane_toggle)
-
-        effort_label = QLabel("Effort:")
-        effort_label.setStyleSheet(f"font-size:12px;color:{_TEXT_SEC};font-weight:600;")
-        controls_row.addWidget(effort_label)
-
-        self.effort_combo = QComboBox()
-        self.effort_combo.setObjectName("effortCombo")
-        self.effort_combo.addItems(["Low", "Medium", "High"])
-        self.effort_combo.setCurrentIndex(0)
-        self.effort_combo.setToolTip(
-            "Low: fast, cheap — simple tasks\n"
-            "Medium: balanced — multi-step tasks\n"
-            "High: thorough — complex research/creation"
+        logo.setStyleSheet(
+            f"font-size:17px;font-weight:800;color:{theme.TEXT_PRIMARY};"
+            f"letter-spacing:-0.3px;background:transparent;"
         )
-        controls_row.addWidget(self.effort_combo)
-        controls_row.addStretch()
-        wb_page_lay.addLayout(controls_row)
+        lay.addWidget(logo)
+        lay.addSpacing(28)
 
-        # Input Card
-        input_card = QFrame()
-        input_card.setObjectName("inputCard")
-        input_shadow = QGraphicsDropShadowEffect()
-        input_shadow.setBlurRadius(16)
-        input_shadow.setColor(QColor(0, 0, 0, 10))
-        input_shadow.setOffset(0, 3)
-        input_card.setGraphicsEffect(input_shadow)
+        self.nav_tabs = SegmentedToggle(
+            ["Workbench", "History"], default=0, on_change=self._on_nav_change
+        )
+        lay.addWidget(self.nav_tabs)
 
-        input_layout = QHBoxLayout(input_card)
-        input_layout.setContentsMargins(8, 4, 4, 4)
-        input_layout.setSpacing(10)
+        lay.addStretch()
 
-        self.goal_input = QLineEdit()
-        self.goal_input.setObjectName("goalInput")
-        self.goal_input.setPlaceholderText("What should I do?  e.g. 'Search for mechanical keyboards under ₹5,000 and summarize'")
-        self.goal_input.returnPressed.connect(self._submit_task)
-        input_layout.addWidget(self.goal_input, stretch=1)
+        self.bell_btn = BellButton()
+        self.bell_btn.clicked.connect(self._toggle_drawer)
+        lay.addWidget(self.bell_btn)
+        return bar
 
-        self.mic_btn = QPushButton("🎙")
-        self.mic_btn.setObjectName("micBtn")
-        self.mic_btn.setToolTip("Voice input (F9)")
-        self.mic_btn.setCursor(Qt.PointingHandCursor)
-        self.mic_btn.setFixedSize(36, 36)
-        self.mic_btn.clicked.connect(self._toggle_voice)
-        input_layout.addWidget(self.mic_btn)
+    def _build_workbench_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        cols = QHBoxLayout(page)
+        cols.setContentsMargins(0, 0, 0, 0)
+        cols.setSpacing(0)
 
-        self.send_btn = QPushButton("Send ↵")
-        self.send_btn.setObjectName("sendBtn")
-        self.send_btn.setCursor(Qt.PointingHandCursor)
-        self.send_btn.clicked.connect(self._submit_task)
-        input_layout.addWidget(self.send_btn)
+        # ---- left reading column -------------------------------------------
+        left = QWidget()
+        left.setStyleSheet("background: transparent;")
+        col = QVBoxLayout(left)
+        col.setContentsMargins(28, 24, 28, 20)
+        col.setSpacing(16)
 
-        self.stop_btn = QPushButton("Stop ■")
-        self.stop_btn.setObjectName("stopBtn")
-        self.stop_btn.setCursor(Qt.PointingHandCursor)
-        self.stop_btn.clicked.connect(self._stop_task)
-        self.stop_btn.hide()
-        input_layout.addWidget(self.stop_btn)
+        col.addWidget(self._build_input_card())
 
-        wb_page_lay.addWidget(input_card)
+        self.chips_row = QWidget()
+        self.chips_row.setStyleSheet("background: transparent;")
+        chips_lay = QHBoxLayout(self.chips_row)
+        chips_lay.setContentsMargins(0, 0, 0, 0)
+        chips_lay.setSpacing(8)
+        for label, goal in _QUICK_CHIPS:
+            chips_lay.addWidget(self._make_chip(label, goal))
+        chips_lay.addStretch()
+        col.addWidget(self.chips_row)
 
-        # Voice overlay — shown while F9 session is active
-        self._voice_panel = QFrame()
-        self._voice_panel.setObjectName("voicePanel")
-        self._voice_panel.hide()
-        vp_lay = QVBoxLayout(self._voice_panel)
-        vp_lay.setContentsMargins(0, 8, 0, 4)
-        vp_lay.setSpacing(6)
-        vp_lay.setAlignment(Qt.AlignHCenter)
-
-        self._orb = OrbWidget()
-        vp_lay.addWidget(self._orb, alignment=Qt.AlignHCenter)
-
-        self._voice_status_lbl = QLabel("Listening… (F9 to stop)")
-        self._voice_status_lbl.setAlignment(Qt.AlignCenter)
-        self._voice_status_lbl.setStyleSheet("color:#6366f1;font-size:12px;font-weight:600;")
-        vp_lay.addWidget(self._voice_status_lbl)
-
-        self._transcript_lbl = QLabel("")
-        self._transcript_lbl.setWordWrap(True)
-        self._transcript_lbl.setAlignment(Qt.AlignCenter)
-        self._transcript_lbl.setStyleSheet("color:#374151;font-size:13px;font-style:italic;")
-        vp_lay.addWidget(self._transcript_lbl)
-
-        wb_page_lay.addWidget(self._voice_panel)
-
-        # Progress Bar
         self.progress = QProgressBar()
         self.progress.setObjectName("progressBar")
         self.progress.setMaximum(0)
         self.progress.setFixedHeight(3)
         self.progress.hide()
-        wb_page_lay.addWidget(self.progress)
+        col.addWidget(self.progress)
 
-        # Floating Approval Alert Banner
+        col.addWidget(self._build_approval_banner())
+        col.addWidget(self._build_output_stack(), stretch=1)
+
+        cols.addWidget(left, stretch=1)
+
+        # ---- right step rail -------------------------------------------------
+        self.step_tracker = StepTracker()
+        cols.addWidget(self.step_tracker)
+        return page
+
+    def _make_chip(self, label: str, goal: str) -> QPushButton:
+        chip = QPushButton(label)
+        chip.setCursor(Qt.PointingHandCursor)
+        chip.setStyleSheet(
+            f"QPushButton {{ background:{theme.SURFACE};"
+            f" border:1px solid {theme.BORDER}; border-radius:20px;"
+            f" padding:7px 16px; font-size:12px; color:{theme.TEXT_SECONDARY}; }}"
+            f"QPushButton:hover {{ border-color:{theme.ACCENT_BORDER};"
+            f" color:{theme.ACCENT}; background:{theme.ACCENT_LIGHT}; }}"
+        )
+        chip.clicked.connect(lambda _=False, g=goal: self._use_chip(g))
+        return chip
+
+    def _use_chip(self, goal: str) -> None:
+        self.goal_input.setText(goal)
+        self.goal_input.setFocus()
+
+    def _build_input_card(self) -> QWidget:
+        card = QFrame()
+        card.setObjectName("inputCard")
+        card.setStyleSheet(
+            f"#inputCard {{ background:{theme.SURFACE};"
+            f" border:1px solid {theme.BORDER};"
+            f" border-radius:{theme.RADIUS_LG}px; }}"
+        )
+        theme.apply_drop_shadow(card, "md")
+
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # -- top row: field + mic + run/stop ---------------------------------
+        top = QWidget()
+        top.setStyleSheet("background: transparent;")
+        top_lay = QHBoxLayout(top)
+        top_lay.setContentsMargins(20, 14, 14, 14)
+        top_lay.setSpacing(12)
+
+        self.goal_input = QLineEdit()
+        self.goal_input.setObjectName("goalInput")
+        self.goal_input.setPlaceholderText("What would you like to do?")
+        self.goal_input.setStyleSheet(
+            f"#goalInput {{ border:none; background:transparent; font-size:15px;"
+            f" color:{theme.TEXT_PRIMARY}; padding:2px 0; }}"
+        )
+        self.goal_input.returnPressed.connect(self._submit_task)
+        top_lay.addWidget(self.goal_input, stretch=1)
+
+        self.mic_btn = QPushButton("🎙")
+        self.mic_btn.setObjectName("micBtn")
+        self.mic_btn.setToolTip("Voice input (F9)")
+        self.mic_btn.setCursor(Qt.PointingHandCursor)
+        self.mic_btn.setFixedSize(40, 40)
+        self.mic_btn.clicked.connect(self._toggle_voice)
+        self._style_mic(active=False)
+        top_lay.addWidget(self.mic_btn)
+
+        self.send_btn = QPushButton("Run  →")
+        self.send_btn.setObjectName("sendBtn")
+        self.send_btn.setCursor(Qt.PointingHandCursor)
+        self.send_btn.setFixedHeight(40)
+        self.send_btn.setStyleSheet(
+            f"#sendBtn {{ background:{theme.ACCENT}; color:#FFFFFF; border:none;"
+            f" border-radius:{theme.RADIUS_MD}px; padding:0 22px;"
+            f" font-size:14px; font-weight:600; }}"
+            f"#sendBtn:hover {{ background:{theme.ACCENT_HOVER}; }}"
+            f"#sendBtn:pressed {{ background:{theme.ACCENT_PRESSED}; }}"
+            f"#sendBtn:disabled {{ background:{theme.BORDER_INPUT}; color:{theme.SURFACE}; }}"
+        )
+        self.send_btn.clicked.connect(self._submit_task)
+        top_lay.addWidget(self.send_btn)
+
+        self.stop_btn = QPushButton("■  Stop")
+        self.stop_btn.setObjectName("stopBtn")
+        self.stop_btn.setCursor(Qt.PointingHandCursor)
+        self.stop_btn.setFixedHeight(40)
+        self.stop_btn.setStyleSheet(
+            f"#stopBtn {{ background:{theme.DANGER}; color:#FFFFFF; border:none;"
+            f" border-radius:{theme.RADIUS_MD}px; padding:0 22px;"
+            f" font-size:14px; font-weight:600; }}"
+            f"#stopBtn:hover {{ background:#B91C1C; }}"
+        )
+        self.stop_btn.clicked.connect(self._stop_task)
+        self.stop_btn.hide()
+        top_lay.addWidget(self.stop_btn)
+
+        outer.addWidget(top)
+
+        # -- bottom strip: lane, effort, hint --------------------------------
+        self.options_bar = QFrame()
+        self.options_bar.setObjectName("optionsBar")
+        self.options_bar.setStyleSheet(
+            f"#optionsBar {{ background:transparent;"
+            f" border-top:1px solid {theme.BORDER_LIGHT}; }}"
+        )
+        opt = QHBoxLayout(self.options_bar)
+        opt.setContentsMargins(20, 8, 20, 8)
+        opt.setSpacing(12)
+
+        self.lane_toggle = SegmentedToggle(
+            ["Headless", "Foreground"], default=0, compact=True,
+            on_change=lambda _: self._update_status_context(),
+        )
+        opt.addWidget(self.lane_toggle)
+
+        divider = QFrame()
+        divider.setFixedSize(1, 16)
+        divider.setStyleSheet(f"background:{theme.BORDER};")
+        opt.addWidget(divider)
+
+        effort_label = QLabel("Effort")
+        effort_label.setStyleSheet(
+            f"font-size:12px;color:{theme.TEXT_TERTIARY};background:transparent;"
+        )
+        opt.addWidget(effort_label)
+
+        self.effort_combo = QComboBox()
+        self.effort_combo.setObjectName("effortCombo")
+        self.effort_combo.addItems(["Low", "Medium", "High"])
+        self.effort_combo.setCurrentIndex(0)
+        self.effort_combo.setCursor(Qt.PointingHandCursor)
+        self.effort_combo.setToolTip(
+            "Low: fast, cheap — simple tasks\n"
+            "Medium: balanced — multi-step tasks\n"
+            "High: thorough — complex research/creation"
+        )
+        self.effort_combo.setStyleSheet(
+            f"#effortCombo {{ background:{theme.INPUT_BG}; border:none;"
+            f" border-radius:10px; padding:4px 10px 4px 14px;"
+            f" font-size:12px; font-weight:500; color:{theme.TEXT_SECONDARY};"
+            f" min-width:64px; }}"
+            f"#effortCombo::drop-down {{ border:none; width:18px; }}"
+            f"#effortCombo QAbstractItemView {{ background:{theme.SURFACE};"
+            f" border:1px solid {theme.BORDER}; border-radius:8px; padding:4px;"
+            f" selection-background-color:{theme.ACCENT_LIGHT};"
+            f" selection-color:{theme.ACCENT}; outline:none; }}"
+        )
+        self.effort_combo.currentTextChanged.connect(lambda _: self._update_status_context())
+        opt.addWidget(self.effort_combo)
+
+        opt.addStretch()
+
+        hint = QLabel("F9 voice")
+        hint.setStyleSheet(
+            f"font-size:11px;color:{theme.TEXT_TERTIARY};background:transparent;"
+        )
+        opt.addWidget(hint)
+
+        outer.addWidget(self.options_bar)
+        return card
+
+    def _style_mic(self, *, active: bool) -> None:
+        if active:
+            self.mic_btn.setStyleSheet(
+                f"#micBtn {{ background:{theme.ACCENT}; border:none;"
+                f" border-radius:{theme.RADIUS_MD}px; font-size:16px; color:#FFFFFF; }}"
+            )
+        else:
+            self.mic_btn.setStyleSheet(
+                f"#micBtn {{ background:{theme.INPUT_BG}; border:none;"
+                f" border-radius:{theme.RADIUS_MD}px; font-size:16px; }}"
+                f"#micBtn:hover {{ background:{theme.ACCENT_LIGHT}; }}"
+            )
+
+    def _build_approval_banner(self) -> QWidget:
         self.approval_banner = QFrame()
         self.approval_banner.setObjectName("approvalBanner")
-        banner_lay = QHBoxLayout(self.approval_banner)
-        banner_lay.setContentsMargins(14, 8, 14, 8)
-        banner_lay.setSpacing(12)
+        self.approval_banner.setStyleSheet(
+            f"#approvalBanner {{ background:{theme.WARNING_BG};"
+            f" border:1px solid {theme.WARNING_BORDER};"
+            f" border-radius:{theme.RADIUS_MD}px; }}"
+        )
+        lay = QHBoxLayout(self.approval_banner)
+        lay.setContentsMargins(16, 10, 12, 10)
+        lay.setSpacing(12)
 
-        self.banner_text = QLabel("⚠️ Action requires confirmation")
-        self.banner_text.setObjectName("approvalBannerText")
-        banner_lay.addWidget(self.banner_text, stretch=1)
+        self.banner_text = QLabel("Action requires confirmation")
+        self.banner_text.setStyleSheet(
+            f"font-weight:600;font-size:13px;color:{theme.WARNING_TEXT};background:transparent;"
+        )
+        lay.addWidget(self.banner_text, stretch=1)
 
-        self.banner_review_btn = QPushButton("Review & Resolve →")
-        self.banner_review_btn.setObjectName("bannerReviewBtn")
-        self.banner_review_btn.setCursor(Qt.PointingHandCursor)
-        self.banner_review_btn.clicked.connect(self._open_approvals_drawer)
-        banner_lay.addWidget(self.banner_review_btn)
+        review = QPushButton("Review  →")
+        review.setCursor(Qt.PointingHandCursor)
+        review.setStyleSheet(
+            f"QPushButton {{ background:{theme.WARNING}; color:#FFFFFF; border:none;"
+            f" border-radius:{theme.RADIUS_SM}px; padding:6px 14px;"
+            f" font-size:12px; font-weight:600; }}"
+            f"QPushButton:hover {{ background:#92400E; }}"
+        )
+        review.clicked.connect(self._open_drawer)
+        lay.addWidget(review)
 
         self.approval_banner.hide()
-        wb_page_lay.addWidget(self.approval_banner)
+        return self.approval_banner
 
-        # Step Progression Component
-        self.step_tracker = StepTracker()
-        wb_page_lay.addWidget(self.step_tracker)
-
-        # Revamped Live Output Workbench
-        workbench = QFrame()
-        workbench.setObjectName("outputWorkbench")
-        wb_shadow = QGraphicsDropShadowEffect()
-        wb_shadow.setBlurRadius(16)
-        wb_shadow.setColor(QColor(0, 0, 0, 8))
-        wb_shadow.setOffset(0, 3)
-        workbench.setGraphicsEffect(wb_shadow)
-
-        wb_layout = QVBoxLayout(workbench)
-        wb_layout.setContentsMargins(0, 0, 0, 0)
-        wb_layout.setSpacing(0)
-
-        # Workbench Toolbar
-        toolbar = QFrame()
-        toolbar.setObjectName("workbenchHeader")
-        tb_layout = QHBoxLayout(toolbar)
-        tb_layout.setContentsMargins(16, 10, 16, 10)
-        tb_layout.setSpacing(10)
-
-        self.wb_status_dot = QLabel("●")
-        self.wb_status_dot.setStyleSheet(f"color:{_INDIGO};font-size:12px;")
-        tb_layout.addWidget(self.wb_status_dot)
-
-        self.wb_title = QLabel("LIVE EXECUTION STREAM")
-        self.wb_title.setStyleSheet(f"font-size:11px;font-weight:800;color:{_TEXT};letter-spacing:0.6px;")
-        tb_layout.addWidget(self.wb_title)
-
-        self.wb_lane_badge = QLabel("HEADLESS")
-        self.wb_lane_badge.setStyleSheet(
-            f"font-size:10px;font-weight:700;color:{_TEXT_SEC};background:{_BG};"
-            f"border:1px solid {_BORDER};border-radius:4px;padding:2px 6px;"
-        )
-        tb_layout.addWidget(self.wb_lane_badge)
-
-        tb_layout.addStretch()
-
-        self.autoscroll_btn = QPushButton("Auto-scroll: ON")
-        self.autoscroll_btn.setProperty("class", "toolBtn")
-        self.autoscroll_btn.setCursor(Qt.PointingHandCursor)
-        self.autoscroll_btn.clicked.connect(self._toggle_autoscroll)
-        tb_layout.addWidget(self.autoscroll_btn)
-
-        self.copy_btn = QPushButton("Copy")
-        self.copy_btn.setProperty("class", "toolBtn")
-        self.copy_btn.setCursor(Qt.PointingHandCursor)
-        self.copy_btn.clicked.connect(self._copy_output)
-        tb_layout.addWidget(self.copy_btn)
-
-        self.clear_btn = QPushButton("Clear")
-        self.clear_btn.setProperty("class", "toolBtn")
-        self.clear_btn.setCursor(Qt.PointingHandCursor)
-        self.clear_btn.clicked.connect(self._clear_output)
-        tb_layout.addWidget(self.clear_btn)
-
-        wb_layout.addWidget(toolbar)
-
-        # Output Stack (Empty vs Active)
+    def _build_output_stack(self) -> QWidget:
         self.output_stack = QStackedWidget()
+        self.output_stack.setStyleSheet("background: transparent;")
 
-        # Page 0: Empty State
-        empty_widget = QWidget()
-        empty_lay = QVBoxLayout(empty_widget)
-        empty_lay.setAlignment(Qt.AlignCenter)
-        empty_lay.setContentsMargins(40, 40, 40, 40)
-        empty_lay.setSpacing(12)
+        # Page 0 — idle. No card chrome: the design keeps the empty workbench
+        # open, so an outlined box around nothing would only add furniture.
+        self.output_stack.addWidget(EmptyState())
 
-        empty_icon = QLabel("🪐")
-        empty_icon.setStyleSheet("font-size: 40px; background: transparent;")
-        empty_icon.setAlignment(Qt.AlignCenter)
-        empty_lay.addWidget(empty_icon)
-
-        empty_title = QLabel("Ready for your next task")
-        empty_title.setStyleSheet(f"font-size: 17px; font-weight: 800; color: {_TEXT};")
-        empty_title.setAlignment(Qt.AlignCenter)
-        empty_lay.addWidget(empty_title)
-
-        empty_desc = QLabel(
-            "Orbit can browse the web, create office documents, write Python code, "
-            "inspect screen state, and run commands."
+        # Page 1 — live output card
+        card = QFrame()
+        card.setObjectName("outputCard")
+        card.setStyleSheet(
+            f"#outputCard {{ background:{theme.SURFACE};"
+            f" border:1px solid {theme.BORDER};"
+            f" border-radius:{theme.RADIUS_LG}px; }}"
         )
-        empty_desc.setStyleSheet(f"font-size: 13px; color: {_TEXT_SEC}; max-width: 480px;")
-        empty_desc.setWordWrap(True)
-        empty_desc.setAlignment(Qt.AlignCenter)
-        empty_lay.addWidget(empty_desc)
+        theme.apply_drop_shadow(card, "sm")
 
-        self.output_stack.addWidget(empty_widget)
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(0, 0, 0, 0)
+        card_lay.setSpacing(0)
 
-        # Page 1: Active Output Text
+        header = QFrame()
+        header.setObjectName("outputHeader")
+        header.setFixedHeight(42)
+        header.setStyleSheet(
+            f"#outputHeader {{ background:transparent;"
+            f" border-bottom:1px solid {theme.BORDER_LIGHT}; }}"
+        )
+        h = QHBoxLayout(header)
+        h.setContentsMargins(18, 0, 14, 0)
+        h.setSpacing(10)
+
+        title = QLabel("Live Output")
+        title.setStyleSheet(
+            f"font-size:12px;font-weight:700;color:{theme.TEXT_PRIMARY};background:transparent;"
+        )
+        h.addWidget(title)
+
+        self.lane_badge = QLabel("HEADLESS")
+        self.lane_badge.setStyleSheet(
+            f"font-size:10px;font-weight:600;color:{theme.ACCENT};"
+            f"background:{theme.ACCENT_LIGHT};border-radius:8px;padding:3px 10px;"
+        )
+        h.addWidget(self.lane_badge)
+
+        self.run_indicator = QLabel("● Running")
+        self.run_indicator.setStyleSheet(
+            f"font-size:11px;font-weight:500;color:{theme.ACCENT};background:transparent;"
+        )
+        h.addWidget(self.run_indicator)
+
+        h.addStretch()
+
+        for label, slot in (("Copy", self._copy_output), ("Clear", self._clear_output)):
+            btn = QPushButton(label)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(
+                f"QPushButton {{ background:{theme.INPUT_BG}; border:none;"
+                f" border-radius:{theme.RADIUS_SM}px; padding:4px 12px;"
+                f" font-size:11px; font-weight:500; color:{theme.TEXT_SECONDARY}; }}"
+                f"QPushButton:hover {{ background:{theme.BORDER}; color:{theme.TEXT_PRIMARY}; }}"
+            )
+            btn.clicked.connect(slot)
+            h.addWidget(btn)
+            if label == "Copy":
+                self.copy_btn = btn
+
+        card_lay.addWidget(header)
+
         self.output_text = QTextEdit()
         self.output_text.setObjectName("outputText")
         self.output_text.setReadOnly(True)
-        self.output_stack.addWidget(self.output_text)
+        self.output_text.setStyleSheet(
+            f"#outputText {{ background:transparent; border:none;"
+            f" font-family:{theme.FONT_MONO}; font-size:12px;"
+            f" color:{theme.TEXT_PRIMARY}; padding:16px 18px;"
+            f" selection-background-color:{theme.ACCENT_LIGHT}; }}"
+        )
+        card_lay.addWidget(self.output_text, stretch=1)
 
-        wb_layout.addWidget(self.output_stack, stretch=1)
-        wb_page_lay.addWidget(workbench, stretch=1)
+        self.output_stack.addWidget(card)
+        return self.output_stack
 
-        self.main_stack.addWidget(workbench_page)
+    def _build_status_bar(self) -> None:
+        status = QStatusBar()
+        status.setSizeGripEnabled(False)
+        status.setFixedHeight(theme.STATUS_HEIGHT)
 
-        # ----------------- PAGE 1: FULL-WINDOW TASK HISTORY -----------------
-        self.history_view = TaskHistoryView(md_renderer=_md_to_html)
-        self.history_view.rerun_requested.connect(self._handle_rerun_task)
-        self.main_stack.addWidget(self.history_view)
+        self.status_dot = QLabel("●")
+        self.status_dot.setStyleSheet(
+            f"color:{theme.SUCCESS};font-size:9px;background:transparent;"
+        )
+        status.addWidget(self.status_dot)
 
-        main_layout.addWidget(self.main_stack, stretch=1)
-        root_h.addWidget(main_col, stretch=1)
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet(
+            f"font-size:11px;font-weight:500;color:{theme.TEXT_SECONDARY};background:transparent;"
+        )
+        status.addWidget(self.status_label)
 
-        # ===================== SLIDE-OUT APPROVALS DRAWER =====================
-        self.drawer = QFrame()
-        self.drawer.setObjectName("drawerContainer")
-        self.drawer.setFixedWidth(0)
-        self._drawer_target_width = 360
+        sep = QLabel("·")
+        sep.setStyleSheet(f"color:{theme.BORDER_INPUT};font-size:11px;background:transparent;")
+        status.addWidget(sep)
 
-        drawer_lay = QVBoxLayout(self.drawer)
-        drawer_lay.setContentsMargins(0, 0, 0, 0)
-        drawer_lay.setSpacing(0)
+        self.status_context = QLabel("")
+        self.status_context.setStyleSheet(
+            f"font-size:11px;color:{theme.TEXT_TERTIARY};background:transparent;"
+        )
+        status.addWidget(self.status_context)
 
-        d_header = QFrame()
-        d_header.setObjectName("drawerHeader")
-        dh_layout = QHBoxLayout(d_header)
-        dh_layout.setContentsMargins(16, 14, 14, 14)
+        self.setStatusBar(status)
+        self._update_status_context()
 
-        d_title = QLabel("Pending Approvals")
-        d_title.setObjectName("drawerTitle")
-        dh_layout.addWidget(d_title)
-        dh_layout.addStretch()
+    def _build_overlays(self) -> None:
+        """Voice modal and approvals drawer, each over its own scrim.
 
-        close_btn = QPushButton("✕")
-        close_btn.setObjectName("drawerCloseBtn")
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.clicked.connect(self._close_drawer)
-        dh_layout.addWidget(close_btn)
+        Children of the central widget rather than dialogs — see the module
+        docstring. Everything starts hidden and is positioned by
+        _layout_overlays().
+        """
+        self.voice_scrim = ScrimWidget(self._central)
+        self.voice_scrim.hide()
+        self.voice_scrim.mousePressEvent = lambda _e: self._cancel_voice()
 
-        drawer_lay.addWidget(d_header)
+        self.voice_modal = VoiceModal(self._central)
+        self.voice_modal.hide()
+        self.voice_modal.cancel_requested.connect(self._cancel_voice)
+        self.voice_modal.commit_requested.connect(self._commit_voice)
 
-        # Approvals Review Card
-        app_body = QWidget()
-        app_lay = QVBoxLayout(app_body)
-        app_lay.setContentsMargins(14, 14, 14, 14)
-        app_lay.setSpacing(12)
+        self.drawer_scrim = ScrimWidget(self._central)
+        self.drawer_scrim.hide()
+        self.drawer_scrim.mousePressEvent = lambda _e: self._close_drawer()
+
+        self.drawer = self._build_drawer()
+        self.drawer.hide()
+
+    def _build_drawer(self) -> QFrame:
+        drawer = QFrame(self._central)
+        drawer.setObjectName("drawer")
+        drawer.setFixedWidth(theme.DRAWER_W)
+        drawer.setStyleSheet(
+            f"#drawer {{ background:{theme.SURFACE};"
+            f" border-left:1px solid {theme.BORDER}; }}"
+        )
+        theme.apply_drop_shadow(drawer, "lg")
+
+        lay = QVBoxLayout(drawer)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        header = QFrame()
+        header.setObjectName("drawerHeader")
+        # ID selector, not a bare property list: a bare `border-bottom` on a
+        # parent is inherited by every child, so the labels below would each
+        # draw their own underline.
+        header.setStyleSheet(
+            f"#drawerHeader {{ border-bottom:1px solid {theme.BORDER}; }}"
+        )
+        h = QHBoxLayout(header)
+        h.setContentsMargins(24, 20, 16, 16)
+        h.setSpacing(8)
+
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        title = QLabel("Pending Approvals")
+        title.setStyleSheet(
+            f"font-size:16px;font-weight:800;color:{theme.TEXT_PRIMARY};"
+            f"letter-spacing:-0.3px;background:transparent;"
+        )
+        title_col.addWidget(title)
+        self.drawer_subtitle = QLabel("Nothing waiting")
+        self.drawer_subtitle.setStyleSheet(
+            f"font-size:12px;color:{theme.TEXT_TERTIARY};background:transparent;"
+        )
+        title_col.addWidget(self.drawer_subtitle)
+        h.addLayout(title_col, stretch=1)
+
+        close = QPushButton("✕")
+        close.setFixedSize(32, 32)
+        close.setCursor(Qt.PointingHandCursor)
+        close.setStyleSheet(
+            f"QPushButton {{ background:{theme.INPUT_BG}; border:none;"
+            f" border-radius:10px; font-size:13px; color:{theme.TEXT_SECONDARY}; }}"
+            f"QPushButton:hover {{ background:{theme.BORDER}; color:{theme.TEXT_PRIMARY}; }}"
+        )
+        close.clicked.connect(self._close_drawer)
+        h.addWidget(close, alignment=Qt.AlignTop)
+
+        lay.addWidget(header)
+
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(24, 18, 24, 18)
+        body_lay.setSpacing(14)
 
         self.confirm_card = QFrame()
-        self.confirm_card.setObjectName("confirmDrawerCard")
-        cc_lay = QVBoxLayout(self.confirm_card)
-        cc_lay.setContentsMargins(12, 12, 12, 12)
-        cc_lay.setSpacing(10)
+        self.confirm_card.setObjectName("confirmCard")
+        self.confirm_card.setStyleSheet(
+            f"#confirmCard {{ background:{theme.SURFACE};"
+            f" border:1px solid {theme.BORDER};"
+            f" border-radius:{theme.RADIUS_XL}px; }}"
+        )
+        cc = QVBoxLayout(self.confirm_card)
+        cc.setContentsMargins(0, 0, 0, 0)
+        cc.setSpacing(0)
+
+        self.confirm_shot = QLabel("No screenshot")
+        self.confirm_shot.setAlignment(Qt.AlignCenter)
+        self.confirm_shot.setMinimumHeight(200)
+        self.confirm_shot.setStyleSheet(
+            f"background:{theme.INPUT_BG};"
+            f"border-bottom:1px solid {theme.BORDER};"
+            f"border-top-left-radius:{theme.RADIUS_XL}px;"
+            f"border-top-right-radius:{theme.RADIUS_XL}px;"
+            f"color:{theme.TEXT_TERTIARY};font-size:11px;"
+        )
+        cc.addWidget(self.confirm_shot)
+
+        detail = QWidget()
+        d = QVBoxLayout(detail)
+        d.setContentsMargins(20, 18, 20, 18)
+        d.setSpacing(10)
+
+        kicker = QLabel("REQUESTED ACTION")
+        kicker.setStyleSheet(
+            f"font-size:10px;font-weight:700;color:{theme.TEXT_TERTIARY};"
+            f"letter-spacing:0.5px;background:transparent;"
+        )
+        d.addWidget(kicker)
 
         self.confirm_heading = QLabel("No pending confirmations")
-        self.confirm_heading.setStyleSheet(f"font-weight:700;font-size:14px;color:{_TEXT};")
         self.confirm_heading.setWordWrap(True)
-        cc_lay.addWidget(self.confirm_heading)
+        self.confirm_heading.setStyleSheet(
+            f"font-size:14px;font-weight:600;color:{theme.TEXT_PRIMARY};background:transparent;"
+        )
+        d.addWidget(self.confirm_heading)
 
         self.confirm_detail = QLabel("")
-        self.confirm_detail.setStyleSheet(f"color:{_TEXT_SEC};font-size:12px;line-height:1.4;")
         self.confirm_detail.setWordWrap(True)
-        cc_lay.addWidget(self.confirm_detail)
+        self.confirm_detail.setStyleSheet(
+            f"font-size:12px;color:{theme.WARNING_TEXT};background:{theme.WARNING_BG};"
+            f"border:1px solid {theme.WARNING_BORDER};border-radius:{theme.RADIUS_MD}px;"
+            f"padding:10px 14px;"
+        )
+        d.addWidget(self.confirm_detail)
 
-        self.confirm_shot = QLabel()
-        self.confirm_shot.setAlignment(Qt.AlignCenter)
-        self.confirm_shot.setMinimumHeight(180)
-        self.confirm_shot.setStyleSheet(f"background:{_BG};border:1px solid {_BORDER};border-radius:8px;")
-        cc_lay.addWidget(self.confirm_shot, stretch=1)
-
-        c_buttons = QHBoxLayout()
-        c_buttons.setSpacing(10)
-        self.approve_btn = QPushButton("Approve Action")
-        self.approve_btn.setObjectName("approveBtn")
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        self.approve_btn = QPushButton("Approve")
+        self.approve_btn.setFixedHeight(44)
         self.approve_btn.setCursor(Qt.PointingHandCursor)
-        self.reject_btn = QPushButton("Reject")
-        self.reject_btn.setObjectName("rejectBtn")
-        self.reject_btn.setCursor(Qt.PointingHandCursor)
+        self.approve_btn.setStyleSheet(
+            f"QPushButton {{ background:{theme.SUCCESS}; color:#FFFFFF; border:none;"
+            f" border-radius:{theme.RADIUS_MD}px; font-size:14px; font-weight:700; }}"
+            f"QPushButton:hover {{ background:#15803D; }}"
+            f"QPushButton:disabled {{ background:{theme.BORDER_INPUT}; color:{theme.SURFACE}; }}"
+        )
         self.approve_btn.clicked.connect(lambda: self._resolve_confirmation(True))
+        buttons.addWidget(self.approve_btn, stretch=1)
+
+        self.reject_btn = QPushButton("Reject")
+        self.reject_btn.setFixedHeight(44)
+        self.reject_btn.setCursor(Qt.PointingHandCursor)
+        self.reject_btn.setStyleSheet(
+            f"QPushButton {{ background:{theme.DANGER_BG}; color:{theme.DANGER};"
+            f" border:1px solid {theme.DANGER_BORDER};"
+            f" border-radius:{theme.RADIUS_MD}px; font-size:14px; font-weight:600; }}"
+            f"QPushButton:hover {{ background:#FEE2E2; }}"
+            f"QPushButton:disabled {{ background:{theme.INPUT_BG};"
+            f" color:{theme.TEXT_TERTIARY}; border-color:{theme.BORDER}; }}"
+        )
         self.reject_btn.clicked.connect(lambda: self._resolve_confirmation(False))
-        c_buttons.addWidget(self.approve_btn, stretch=1)
-        c_buttons.addWidget(self.reject_btn, stretch=1)
-        cc_lay.addLayout(c_buttons)
+        buttons.addWidget(self.reject_btn, stretch=1)
 
-        app_lay.addWidget(self.confirm_card, stretch=1)
-        drawer_lay.addWidget(app_body, stretch=1)
+        d.addLayout(buttons)
+        cc.addWidget(detail)
 
-        root_h.addWidget(self.drawer)
+        body_lay.addWidget(self.confirm_card)
+        body_lay.addStretch()
+        lay.addWidget(body, stretch=1)
+        return drawer
 
-        self.setCentralWidget(central)
+    def _setup_shortcuts(self) -> None:
+        # Esc: cancel voice first, then close the drawer. Only one overlay is
+        # ever open at a time, so the order just picks a winner if that changes.
+        esc = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        esc.activated.connect(self._on_escape)
 
-        # -- Status Bar -------------------------------------------------------
-        status = QStatusBar()
-        self.status_dot = QLabel()
-        self.status_dot.setObjectName("statusDot")
-        status.addWidget(self.status_dot)
-        self.status_label = QLabel("Ready")
-        status.addWidget(self.status_label)
-        status.addPermanentWidget(QLabel(f"Python {sys.version.split()[0]}"))
-        self.setStatusBar(status)
+    def _on_escape(self) -> None:
+        if self.voice_modal.isVisible():
+            self._cancel_voice()
+        elif self._drawer_open:
+            self._close_drawer()
 
-        # -- Timers & DB Watcher ----------------------------------------------
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self._refresh_data)
-        self.refresh_timer.start(2000)
-        self._refresh_data()
-        self._set_status("idle")
-        self._setup_voice()
+    # ===================== overlay geometry =====================
 
-    # -- Voice ----------------------------------------------------------------
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._layout_overlays()
+
+    def _layout_overlays(self) -> None:
+        w, h = self._central.width(), self._central.height()
+        self.voice_scrim.setGeometry(0, 0, w, h)
+        self.drawer_scrim.setGeometry(0, 0, w, h)
+        self.drawer.setGeometry(w - theme.DRAWER_W, 0, theme.DRAWER_W, h)
+        if self.voice_modal.isVisible():
+            self.voice_modal.adjustSize()
+            self.voice_modal.center_on(self._central)
+
+    # ===================== navigation =====================
+
+    def _on_nav_change(self, value: str) -> None:
+        if value == "workbench":
+            self.main_stack.setCurrentIndex(0)
+        else:
+            self.main_stack.setCurrentIndex(1)
+            self.history_view.refresh()
+
+    def _show_workbench(self) -> None:
+        self.nav_tabs.set_index(0)
+        self.main_stack.setCurrentIndex(0)
+
+    def _show_history(self) -> None:
+        # Goes through the toggle so the nav pill and the page stack can never
+        # disagree about which tab is current.
+        self.nav_tabs.set_index(1)
+        self.main_stack.setCurrentIndex(1)
+        self.history_view.refresh()
+
+    def _handle_rerun_task(self, goal: str, lane: str) -> None:
+        self._show_workbench()
+        self.lane_toggle.set_value(lane)
+        self.goal_input.setText(goal)
+        self.goal_input.setFocus()
+
+    # ===================== voice =====================
 
     def _setup_voice(self) -> None:
         self._voice_ctrl = VoiceController(self)
         self._voice_ctrl.session_started.connect(self._on_voice_started)
         self._voice_ctrl.session_stopped.connect(self._on_voice_stopped)
-        self._voice_ctrl.volume_rms.connect(self._orb.set_volume)
+        self._voice_ctrl.volume_rms.connect(self.voice_modal.orb.set_volume)
         self._voice_ctrl.transcript_interim.connect(self._on_transcript_interim)
         self._voice_ctrl.transcript_final_segment.connect(self._on_transcript_final)
         self._voice_ctrl.transcript_ready.connect(self._on_transcript_ready)
@@ -1073,121 +1179,60 @@ class OrbitWindow(QMainWindow):
         if self._voice_ctrl:
             self._voice_ctrl.toggle()
 
+    def _cancel_voice(self) -> None:
+        if self._voice_ctrl:
+            self._voice_ctrl.cancel()
+
+    def _commit_voice(self) -> None:
+        """"Use transcript" — same commit path as a second F9 press."""
+        if self._voice_ctrl:
+            self._voice_ctrl.toggle()
+
     def _on_voice_started(self) -> None:
-        self._voice_panel.show()
-        self._transcript_lbl.setText("")
-        self._committed_text = ""  # track final segments separately from interims
-        self._voice_status_lbl.setText("Listening… (F9 to stop)")
-        self.mic_btn.setStyleSheet("background:#6366f1;color:white;border-radius:18px;")
+        self._committed_text = ""
+        self.voice_modal.begin()
+        self.voice_scrim.show()
+        self.voice_scrim.raise_()
+        self.voice_modal.show()
+        self.voice_modal.adjustSize()
+        self.voice_modal.center_on(self._central)
+        self.voice_modal.raise_()
+        self._style_mic(active=True)
+        self._set_status("recording")
 
     def _on_voice_stopped(self) -> None:
-        self._voice_panel.hide()
-        self._orb.set_volume(0.0)
-        self.mic_btn.setStyleSheet("")
+        self.voice_modal.end()
+        self.voice_modal.hide()
+        self.voice_scrim.hide()
+        self._style_mic(active=False)
+        self._set_status("running" if self._task_running else "idle")
 
     def _on_transcript_interim(self, text: str) -> None:
-        display = (self._committed_text + " " + text).strip() if self._committed_text else text
-        self._transcript_lbl.setText(display)
+        display = f"{self._committed_text} {text}".strip() if self._committed_text else text
+        self.voice_modal.set_transcript(display)
 
     def _on_transcript_final(self, text: str) -> None:
-        self._committed_text = (self._committed_text + " " + text).strip()
-        self._transcript_lbl.setText(self._committed_text)
+        self._committed_text = f"{self._committed_text} {text}".strip()
+        self.voice_modal.set_transcript(self._committed_text)
 
     def _on_transcript_ready(self, text: str) -> None:
         if text:
             self.goal_input.setText(text)
             self.goal_input.setFocus()
 
-    # -- Navigation Switcher --------------------------------------------------
-
-    def _show_workbench(self) -> None:
-        self.main_stack.setCurrentIndex(0)
-        self.tab_workbench_btn.setStyleSheet(
-            f"border:none;border-radius:8px;padding:6px 16px;font-size:12px;font-weight:700;"
-            f"color:{_WHITE};background:{_INDIGO};"
-        )
-        self.tab_history_btn.setStyleSheet(
-            f"border:none;border-radius:8px;padding:6px 16px;font-size:12px;font-weight:600;"
-            f"color:{_TEXT_SEC};background:transparent;"
-        )
-
-    def _show_history(self) -> None:
-        self.main_stack.setCurrentIndex(1)
-        self.history_view.refresh()
-        self.tab_history_btn.setStyleSheet(
-            f"border:none;border-radius:8px;padding:6px 16px;font-size:12px;font-weight:700;"
-            f"color:{_WHITE};background:{_INDIGO};"
-        )
-        self.tab_workbench_btn.setStyleSheet(
-            f"border:none;border-radius:8px;padding:6px 16px;font-size:12px;font-weight:600;"
-            f"color:{_TEXT_SEC};background:transparent;"
-        )
-
-    def _handle_rerun_task(self, goal: str, lane: str) -> None:
-        self._show_workbench()
-        self.lane_toggle.set_value(lane)
-        self.goal_input.setText(goal)
-        self.goal_input.setFocus()
-
-    # -- Approvals Drawer Slide Animations ------------------------------------
-
-    def _animate_drawer_width(self, target_w: int) -> None:
-        self._drawer_anim = QPropertyAnimation(self.drawer, b"maximumWidth")
-        self._drawer_anim.setDuration(260)
-        self._drawer_anim.setStartValue(self.drawer.width())
-        self._drawer_anim.setEndValue(target_w)
-        self._drawer_anim.setEasingCurve(QEasingCurve.OutCubic)
-        self._drawer_anim.start()
-
-    def _open_approvals_drawer(self) -> None:
-        self._drawer_open = True
-        self.approvals_btn.setProperty("class", "navBtnActive")
-        self.approvals_btn.style().unpolish(self.approvals_btn)
-        self.approvals_btn.style().polish(self.approvals_btn)
-        self._animate_drawer_width(self._drawer_target_width)
-
-    def _toggle_approvals(self) -> None:
-        if self._drawer_open:
-            self._close_drawer()
-        else:
-            self._open_approvals_drawer()
-
-    def _close_drawer(self) -> None:
-        self._drawer_open = False
-        self.approvals_btn.setProperty("class", "navBtn")
-        self.approvals_btn.style().unpolish(self.approvals_btn)
-        self.approvals_btn.style().polish(self.approvals_btn)
-        self._animate_drawer_width(0)
-
-    # -- Workbench Toolbar Actions --------------------------------------------
-
-    def _toggle_autoscroll(self) -> None:
-        self._auto_scroll = not self._auto_scroll
-        self.autoscroll_btn.setText(f"Auto-scroll: {'ON' if self._auto_scroll else 'OFF'}")
-
-    def _copy_output(self) -> None:
-        plain_text = self.output_text.toPlainText()
-        if plain_text:
-            QGuiApplication.clipboard().setText(plain_text)
-            self.copy_btn.setText("✓ Copied!")
-            QTimer.singleShot(1500, lambda: self.copy_btn.setText("Copy"))
-
-    # -- Task Submission ------------------------------------------------------
+    # ===================== task submission =====================
 
     def _ensure_worker(self) -> None:
-        """Spawn the warm worker process if it is not already running.
+        """Spawn the warm worker if it is not already running.
 
-        The worker runs `orbit.run_task --serve`, which reads one JSON goal
-        line per task from stdin and emits [TASK:DONE exit_code] when done.
-        Python imports + the event loop pay their cost once at GUI startup;
-        subsequent tasks skip the 7–8 s cold-start and go straight to the
-        first LLM call.
+        The worker runs `orbit.run_task --serve`, reading one JSON goal line
+        per task from stdin and emitting [TASK:DONE exit_code] when done, so
+        Python imports and the event loop pay their cost once instead of per
+        task (~7-8 s of cold start each).
         """
         if self._worker is not None and self._worker.state() != QProcess.NotRunning:
             return
-        env = QProcess.systemEnvironment()
         w = QProcess(self)
-        w.setEnvironment(env)
         w.setProcessChannelMode(QProcess.SeparateChannels)
         w.readyReadStandardOutput.connect(self._read_stdout)
         w.readyReadStandardError.connect(self._read_stderr)
@@ -1204,25 +1249,30 @@ class OrbitWindow(QMainWindow):
         effort = self.effort_combo.currentText().lower()
 
         self._ensure_worker()
-
         req = json.dumps({"goal": goal, "lane": lane, "effort": effort})
         self._worker.write((req + "\n").encode())  # type: ignore[union-attr]
-        self._task_running = True
 
+        self._task_running = True
+        self._task_started_at = time.time()
         self._raw_buffer = ""
         self._goal_header = f"> {goal}\n  ({lane} | effort: {effort})\n"
+
         self.output_text.clear()
         self.output_stack.setCurrentIndex(1)
         self.step_tracker.reset()
 
-        self.wb_lane_badge.setText(lane.upper())
-        self.wb_status_dot.setStyleSheet(f"color:{_AMBER};font-size:12px;")
+        self.lane_badge.setText(lane.upper())
+        self.run_indicator.setText("● Running")
+        self.run_indicator.setStyleSheet(
+            f"font-size:11px;font-weight:500;color:{theme.ACCENT};background:transparent;"
+        )
 
-        self._append_plain(f"> {goal}\n", _INDIGO)
-        self._append_plain(f"  {lane} lane  |  effort: {effort}\n\n", _TEXT_SEC)
+        self._append_plain(f"> {goal}\n", theme.ACCENT)
+        self._append_plain(f"  {lane} lane · effort: {effort}\n\n", theme.TEXT_TERTIARY)
 
         self.goal_input.clear()
         self.goal_input.setEnabled(False)
+        self.chips_row.hide()
         self.send_btn.hide()
         self.stop_btn.show()
         self.progress.show()
@@ -1230,12 +1280,9 @@ class OrbitWindow(QMainWindow):
 
     def _stop_task(self) -> None:
         if self._worker and self._task_running:
-            self._append_plain("\n[task stopped by user]\n", _RED_TEXT)
-            # Kill the worker; _worker_exited fires via the finished signal
-            # and calls _task_done so the UI is restored exactly once.
+            self._append_plain("\n[task stopped by user]\n", theme.DANGER_TEXT)
+            # _worker_exited fires via finished and calls _task_done exactly once.
             self._worker.kill()
-
-    _TASK_DONE_RE = re.compile(r"\[TASK:DONE (\d+)\]")
 
     def _read_stdout(self) -> None:
         if not self._worker:
@@ -1245,10 +1292,10 @@ class OrbitWindow(QMainWindow):
         for line in text.splitlines(keepends=True):
             stripped = line.strip()
 
-            # Warm-worker sentinel: task finished, restore UI without exiting.
-            # Do NOT accumulate this line into _raw_buffer.
             done_m = self._TASK_DONE_RE.search(stripped)
             if done_m:
+                # Sentinel — never goes into _raw_buffer, which is what the
+                # final render re-parses.
                 self._task_done(int(done_m.group(1)))
                 continue
 
@@ -1256,10 +1303,9 @@ class OrbitWindow(QMainWindow):
 
             step_m = self._STEP_RE.match(stripped)
             if step_m:
-                marker_type = step_m.group(1)
-                description = step_m.group(2).strip()
-                detail = (step_m.group(3) or "").strip()
-                self.step_tracker.handle_marker(marker_type, description, detail)
+                self.step_tracker.handle_marker(
+                    step_m.group(1), step_m.group(2).strip(), (step_m.group(3) or "").strip()
+                )
                 continue
 
             tool_m = self._TOOL_CALL_RE.search(stripped)
@@ -1268,25 +1314,10 @@ class OrbitWindow(QMainWindow):
 
             m = self._SCREENSHOT_RE.search(line)
             if m:
-                self._append_plain(line, _TEXT_SEC)
+                self._append_plain(line, theme.TEXT_SECONDARY)
                 self._insert_screenshot(m.group(1).strip())
             else:
-                self._append_plain(line, _TEXT)
-
-    def _insert_screenshot(self, path: str) -> None:
-        p = Path(path)
-        if not p.exists():
-            return
-        cursor = self.output_text.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        cursor.insertHtml(
-            f'<div style="margin:12px 0;"><img src="file:///{p.as_posix()}" '
-            f'width="580" style="border:1px solid {_BORDER};border-radius:10px;'
-            f'box-shadow: 0 4px 6px -1px rgba(0,0,0,0.06);"></div>'
-        )
-        self.output_text.setTextCursor(cursor)
-        if self._auto_scroll:
-            self.output_text.ensureCursorVisible()
+                self._append_plain(line, theme.TEXT_PRIMARY)
 
     def _read_stderr(self) -> None:
         if not self._worker:
@@ -1297,14 +1328,26 @@ class OrbitWindow(QMainWindow):
             if any(noise in line for noise in self._STDERR_NOISE):
                 continue
             if line.strip():
-                self._append_plain(line, _RED_TEXT)
+                self._append_plain(line, theme.DANGER_TEXT)
+
+    def _insert_screenshot(self, path: str) -> None:
+        p = Path(path)
+        if not p.exists():
+            return
+        cursor = self.output_text.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertHtml(
+            f'<div style="margin:12px 0;"><img src="file:///{p.as_posix()}" '
+            f'width="520" style="border:1px solid {theme.BORDER};border-radius:14px;"></div>'
+        )
+        self.output_text.setTextCursor(cursor)
+        if self._auto_scroll:
+            self.output_text.ensureCursorVisible()
 
     def _task_done(self, exit_code: int) -> None:
-        """Restore the UI after a task completes (normal finish or kill).
-        Called from _read_stdout when [TASK:DONE] arrives, or from
-        _worker_exited when the process exits unexpectedly."""
+        """Restore the UI after a task ends (normal finish or kill)."""
         if not self._task_running:
-            return  # guard against duplicate calls
+            return  # guard against the sentinel and finished() both firing
         self._task_running = False
 
         for s in self.step_tracker.steps:
@@ -1315,33 +1358,36 @@ class OrbitWindow(QMainWindow):
         self.step_tracker._refresh_all_widgets()
 
         self.goal_input.setEnabled(True)
+        self.chips_row.show()
         self.send_btn.show()
         self.stop_btn.hide()
         self.progress.hide()
+
+        ok = exit_code == 0
+        self.run_indicator.setText("● Completed" if ok else "● Failed")
+        self.run_indicator.setStyleSheet(
+            f"font-size:11px;font-weight:500;"
+            f"color:{theme.SUCCESS if ok else theme.DANGER};background:transparent;"
+        )
+
         self._render_final_output(exit_code)
-        if exit_code == 0:
-            self._set_status("idle")
-            self.wb_status_dot.setStyleSheet(f"color:{_GREEN};font-size:12px;")
-        else:
-            self._set_status("error")
-            self.wb_status_dot.setStyleSheet(f"color:{_RED};font-size:12px;")
+        self._set_status("idle" if ok else "error")
         self._refresh_data()
         self.goal_input.setFocus()
 
     def _worker_exited(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
-        """Worker process exited (crash or explicit kill). Clean up and let
-        the next _submit_task respawn it via _ensure_worker."""
+        """Worker died (crash or explicit kill); next submit respawns it."""
         self._worker = None
         if self._task_running:
             self._task_done(exit_code)
 
     def _render_final_output(self, exit_code: int) -> None:
         header_html = (
-            f'<div style="background:{_INDIGO_LIGHT};border:1px solid {_INDIGO_BORDER};'
-            f'border-radius:10px;padding:12px 16px;margin-bottom:14px;">'
-            f'<p style="color:{_INDIGO_TEXT};font-size:15px;font-weight:700;margin:0 0 2px 0;">'
+            f'<div style="background:{theme.ACCENT_LIGHT};border:1px solid {theme.ACCENT_BORDER};'
+            f'border-radius:14px;padding:12px 16px;margin-bottom:14px;">'
+            f'<p style="color:{theme.ACCENT_PRESSED};font-size:15px;font-weight:700;margin:0 0 2px 0;">'
             f'{_inline_md(self._goal_header.split(chr(10))[0])}</p>'
-            f'<p style="color:{_TEXT_SEC};font-size:12px;margin:0;">'
+            f'<p style="color:{theme.TEXT_SECONDARY};font-size:12px;margin:0;">'
             f'{_inline_md(self._goal_header.split(chr(10))[1] if chr(10) in self._goal_header else "")}</p>'
             f'</div>'
         )
@@ -1352,47 +1398,40 @@ class OrbitWindow(QMainWindow):
         body_html = ""
         for section in sections:
             s = section.strip()
-            if not s:
-                continue
-            if s.startswith("> ") or s.startswith("(working"):
+            if not s or s.startswith("> ") or s.startswith("(working"):
                 continue
             if s.startswith("task_id:"):
-                task_line = s.split("\n")[0]
                 body_html += (
-                    f'<p style="color:{_TEXT_SEC};font-size:11px;margin:12px 0 0 0;'
-                    f'font-family:\'Cascadia Code\',\'Consolas\',monospace;">'
-                    f'{_inline_md(task_line)}</p>'
+                    f'<p style="color:{theme.TEXT_TERTIARY};font-size:11px;margin:12px 0 0 0;'
+                    f'font-family:{theme.FONT_MONO};">{_inline_md(s.splitlines()[0])}</p>'
                 )
                 continue
-            filtered_lines = [
-                l for l in s.splitlines()
-                if not self._STEP_RE.match(l.strip())
-            ]
-            cleaned_s = "\n".join(filtered_lines).strip()
-            if cleaned_s:
-                body_html += _md_to_html(cleaned_s)
+            cleaned = "\n".join(
+                l for l in s.splitlines() if not self._STEP_RE.match(l.strip())
+            ).strip()
+            if cleaned:
+                body_html += _md_to_html(cleaned)
 
-        status_color = _GREEN_TEXT if exit_code == 0 else _RED_TEXT
-        status_bg = _GREEN_LIGHT if exit_code == 0 else _RED_LIGHT
-        status_border = _GREEN_BORDER if exit_code == 0 else _RED_BORDER
-        status_text = "Task completed successfully" if exit_code == 0 else f"Task failed with exit code {exit_code}"
+        ok = exit_code == 0
         status_html = (
-            f'<div style="background:{status_bg};border:1px solid {status_border};'
-            f'border-radius:8px;padding:8px 12px;margin-top:14px;display:inline-block;">'
-            f'<span style="color:{status_color};font-size:12px;font-weight:700;">● {status_text}</span>'
-            f'</div>'
+            f'<div style="background:{theme.SUCCESS_BG if ok else theme.DANGER_BG};'
+            f'border:1px solid {theme.SUCCESS_BORDER if ok else theme.DANGER_BORDER};'
+            f'border-radius:10px;padding:8px 14px;margin-top:14px;">'
+            f'<span style="color:{theme.SUCCESS_TEXT if ok else theme.DANGER_TEXT};'
+            f'font-size:12px;font-weight:600;">● '
+            f'{"Task completed successfully" if ok else f"Task failed (exit {exit_code})"}'
+            f'</span></div>'
         )
 
-        full_html = (
-            f'<div style="font-family:\'Segoe UI Variable\',\'Segoe UI\',sans-serif;padding:6px;">'
+        self.output_text.setHtml(
+            f'<div style="font-family:{theme.FONT_FAMILY};padding:4px;">'
             f'{header_html}{body_html}{status_html}</div>'
         )
-        self.output_text.setHtml(full_html)
         cursor = self.output_text.textCursor()
         cursor.movePosition(cursor.MoveOperation.Start)
         self.output_text.setTextCursor(cursor)
 
-    # -- Output Helpers -------------------------------------------------------
+    # ===================== output helpers =====================
 
     def _append_plain(self, text: str, color: str) -> None:
         cursor = self.output_text.textCursor()
@@ -1405,59 +1444,95 @@ class OrbitWindow(QMainWindow):
         if self._auto_scroll:
             self.output_text.ensureCursorVisible()
 
+    def _copy_output(self) -> None:
+        text = self.output_text.toPlainText()
+        if text:
+            QGuiApplication.clipboard().setText(text)
+            self.copy_btn.setText("Copied")
+            QTimer.singleShot(1400, lambda: self.copy_btn.setText("Copy"))
+
     def _clear_output(self) -> None:
         self.output_text.clear()
         self._raw_buffer = ""
         self.step_tracker.reset()
         self.output_stack.setCurrentIndex(0)
-        self.wb_status_dot.setStyleSheet(f"color:{_INDIGO};font-size:12px;")
 
-    # -- Database & Approvals Refresh -----------------------------------------
+    # ===================== approvals =====================
+
+    def _open_drawer(self) -> None:
+        self._drawer_open = True
+        self._layout_overlays()
+        self.drawer_scrim.show()
+        self.drawer_scrim.raise_()
+        self.drawer.show()
+        self.drawer.raise_()
+
+        # Slide in from the right edge.
+        end = QPoint(self._central.width() - theme.DRAWER_W, 0)
+        self._drawer_anim = QPropertyAnimation(self.drawer, b"pos")
+        self._drawer_anim.setDuration(220)
+        self._drawer_anim.setStartValue(QPoint(self._central.width(), 0))
+        self._drawer_anim.setEndValue(end)
+        self._drawer_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._drawer_anim.start()
+
+    def _close_drawer(self) -> None:
+        if not self._drawer_open:
+            return
+        self._drawer_open = False
+        self._drawer_anim = QPropertyAnimation(self.drawer, b"pos")
+        self._drawer_anim.setDuration(180)
+        self._drawer_anim.setStartValue(self.drawer.pos())
+        self._drawer_anim.setEndValue(QPoint(self._central.width(), 0))
+        self._drawer_anim.setEasingCurve(QEasingCurve.InCubic)
+        self._drawer_anim.finished.connect(self.drawer.hide)
+        self._drawer_anim.start()
+        self.drawer_scrim.hide()
+
+    def _toggle_drawer(self) -> None:
+        self._close_drawer() if self._drawer_open else self._open_drawer()
 
     def _refresh_data(self) -> None:
         db.init_db()
         self._refresh_confirmations()
-        tasks = db.list_tasks(limit=100)
-        self.tab_history_btn.setText(f"📜 History & Analytics ({len(tasks)})")
 
     def _refresh_confirmations(self) -> None:
         pending = db.list_pending_confirmations()
         count = len(pending)
-        self.approvals_btn.setText(f"Approvals ({count})")
+        self._pending_count = count
+        self.bell_btn.set_count(count)
 
-        if count > 0:
-            if not self._drawer_open:
-                self.approvals_btn.setProperty("class", "navBtnAlert")
-                self.approvals_btn.style().unpolish(self.approvals_btn)
-                self.approvals_btn.style().polish(self.approvals_btn)
-
+        if count:
             row = pending[0]
             self._current_confirm_id = row["confirmation_id"]
             action = row.get("action", "UI action")
-            self.banner_text.setText(f"⚠️ Confirmation Required: {action} ({count} pending)")
+            self.banner_text.setText(f"Confirmation required: {action}")
             self.approval_banner.show()
 
-            self.confirm_heading.setText(f"Approval Required: {action}")
+            self.drawer_subtitle.setText(
+                f"{count} action{'s' if count != 1 else ''} need"
+                f"{'' if count != 1 else 's'} your confirmation"
+            )
+            self.confirm_heading.setText(
+                f"{action} — {row.get('candidate_label') or 'low-confidence target'}"
+            )
             ttl = load_windows_control_policy().get("approval_token_ttl_seconds", 120)
             self.confirm_detail.setText(
-                f"<b>Target:</b> {row.get('candidate_label') or 'Low confidence coordinate'}<br>"
-                f"<b>Task:</b> {row['task_id']} &nbsp;|&nbsp; <b>Requested:</b> {row['created_at']}<br>"
-                f"<i>Approving grants ONE single action, valid for {ttl}s.</i>"
+                f"Approving grants ONE single action, valid for {ttl}s. "
+                f"Task {row['task_id']}."
             )
+            self.confirm_detail.show()
             self._render_confirm_shot(row)
             self.approve_btn.setEnabled(True)
             self.reject_btn.setEnabled(True)
         else:
             self._current_confirm_id = None
             self.approval_banner.hide()
-            if not self._drawer_open:
-                self.approvals_btn.setProperty("class", "navBtn")
-                self.approvals_btn.style().unpolish(self.approvals_btn)
-                self.approvals_btn.style().polish(self.approvals_btn)
-
+            self.drawer_subtitle.setText("Nothing waiting")
             self.confirm_heading.setText("No pending confirmations")
-            self.confirm_detail.setText("When a tool requires human-in-the-loop approval, review details and screenshot will appear here.")
-            self.confirm_shot.setText("(no screenshot)")
+            self.confirm_detail.hide()
+            self.confirm_shot.setPixmap(QPixmap())
+            self.confirm_shot.setText("No screenshot")
             self.approve_btn.setEnabled(False)
             self.reject_btn.setEnabled(False)
 
@@ -1465,19 +1540,20 @@ class OrbitWindow(QMainWindow):
         path = row.get("screenshot_path")
         pixmap = QPixmap(path) if path else QPixmap()
         if pixmap.isNull():
-            self.confirm_shot.setText("(no screenshot available)")
+            self.confirm_shot.setPixmap(QPixmap())
+            self.confirm_shot.setText("No screenshot available")
             return
         box = row.get("candidate_box")
         if box:
             painter = QPainter(pixmap)
-            painter.setPen(QPen(QColor(_INDIGO), 3))
+            painter.setPen(QPen(QColor(theme.WARNING), 3))
             left, top, right, bottom = box
             painter.drawRect(QRect(left, top, right - left, bottom - top))
             painter.end()
+        self.confirm_shot.setText("")
         self.confirm_shot.setPixmap(
             pixmap.scaled(
-                self.confirm_shot.width() or 320, 180,
-                Qt.KeepAspectRatio, Qt.SmoothTransformation,
+                theme.DRAWER_W - 48, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
         )
 
@@ -1493,26 +1569,57 @@ class OrbitWindow(QMainWindow):
                 ),
             )
         except KeyError:
+            # Already decided — by the REPL asker or a second dashboard.
+            # A race, not an error; the refresh below shows the truth.
             pass
         self._refresh_confirmations()
 
-    # -- Status Bar -----------------------------------------------------------
+    # ===================== status bar =====================
 
     def _set_status(self, state: str) -> None:
-        dots = {
-            "idle": f'<span style="color:{_GREEN}">●</span>',
-            "running": f'<span style="color:{_AMBER}">●</span>',
-            "error": f'<span style="color:{_RED}">●</span>',
+        colors = {
+            "idle": theme.SUCCESS,
+            "running": theme.WARNING,
+            "recording": theme.DANGER,
+            "error": theme.DANGER,
         }
-        labels = {"idle": "Ready", "running": "Task executing...", "error": "Task failed"}
-        self.status_dot.setText(dots.get(state, ""))
-        self.status_label.setText(f"  {labels.get(state, state)}")
+        labels = {
+            "idle": "Ready",
+            "running": "Running",
+            "recording": "Recording",
+            "error": "Failed",
+        }
+        color = colors.get(state, theme.TEXT_TERTIARY)
+        self._status_state = state
+        self.status_dot.setStyleSheet(f"color:{color};font-size:9px;background:transparent;")
+        self.status_label.setText(labels.get(state, state))
+        self.status_label.setStyleSheet(
+            f"font-size:11px;font-weight:{'600' if state in ('recording', 'error') else '500'};"
+            f"color:{color if state in ('recording', 'error') else theme.TEXT_SECONDARY};"
+            f"background:transparent;"
+        )
+        self._update_status_context()
+
+    def _update_status_context(self) -> None:
+        """Right half of the status line: lane · effort [· elapsed]."""
+        if not hasattr(self, "status_context"):
+            return
+        lane = self.lane_toggle.value().capitalize()
+        effort = self.effort_combo.currentText().lower()
+        parts = [f"{lane} · {effort} effort"]
+        if self._task_running and self._task_started_at:
+            parts.append(f"{format_duration(time.time() - self._task_started_at)} elapsed")
+        self.status_context.setText("  ·  ".join(parts))
+
+    def _tick_status(self) -> None:
+        if self._task_running:
+            self._update_status_context()
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    app.setStyleSheet(STYLESHEET)
+    app.setStyleSheet(theme.STYLESHEET)
     window = OrbitWindow()
     window.show()
     return app.exec()
@@ -1520,4 +1627,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

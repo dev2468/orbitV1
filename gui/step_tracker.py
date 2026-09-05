@@ -1,8 +1,28 @@
-"""StepTracker widget for Orbit GUI.
+"""StepTracker — the Workbench's right-hand step rail.
 
-Provides visual step-by-step progress tracking for running tasks, parsing
-agent phase markers ([STEP:START], [STEP:DONE], [STEP:FAIL], [STEP:PROGRESS])
-and tool calls as fallback.
+Parses the agent's phase markers ([STEP:START], [STEP:DONE], [STEP:FAIL],
+[STEP:PROGRESS]) and falls back to inferring a step from each tool call when
+the model emits no markers at all.
+
+## Why this is a fixed-width rail, not a card in the main column
+
+The Studio design moves progress out of the reading column entirely. Steps are
+*peripheral* information — you glance at them to answer "is it stuck?", then go
+back to the output. Sitting inline above the output stream, the tracker pushed
+the thing you actually read down the page and resized it on every step, so the
+output jumped while you were reading it. As a fixed 220px rail the output pane
+never reflows, and the step list can grow to whatever length it needs.
+
+The rail is always visible, including when empty (it shows a placeholder). An
+appearing/disappearing sidebar would reflow the output pane exactly the way
+the inline card did, which is the thing this layout exists to stop.
+
+## Connector color encodes the *next* step, not the current one
+
+Each node's trailing connector is colored by the status of the step below it:
+green once that step is done, indigo while it is running, stone while it is
+still pending. So the rail reads as a filling pipe — color has reached exactly
+as far as work has — instead of a column of disconnected status dots.
 """
 
 from __future__ import annotations
@@ -15,12 +35,10 @@ from typing import Optional
 from PySide6.QtCore import (
     QEasingCurve,
     QPropertyAnimation,
-    QRect,
-    QSize,
     Qt,
     QTimer,
 )
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
@@ -44,7 +62,7 @@ _TOOL_STEP_MAP = {
     "windows_open_app": "Opening application",
     "windows_click": "Interacting with window",
     "windows_type": "Typing text",
-    "windows_key": "Pressing keyboard shortcut",
+    "windows_key": "Pressing shortcut",
     "windows_scroll": "Scrolling window",
     "windows_drag": "Dragging element",
     "windows_batch_actions": "Executing UI actions",
@@ -52,7 +70,7 @@ _TOOL_STEP_MAP = {
     "perception_get_state": "Checking screen state",
     "perception_get_uia_tree": "Reading UI structure",
     "perception_find_element": "Finding UI element",
-    "perception_wait_for_visual_change": "Waiting for screen update",
+    "perception_wait_for_visual_change": "Waiting for screen",
     "run_command": "Running a command",
     "read_file": "Reading file",
     "write_file": "Writing file",
@@ -62,6 +80,10 @@ _TOOL_STEP_MAP = {
     "memory_search_tasks": "Searching memory",
     "memory_add": "Saving context",
 }
+
+_NODE = 22          # node diameter, per the design
+_ICON_W = 26        # icon column width
+_ROW_MIN_H = 34
 
 
 class StepStatus(str, Enum):
@@ -73,7 +95,7 @@ class StepStatus(str, Enum):
 
 @dataclass
 class Step:
-    """Represents a single discrete milestone or phase in a task."""
+    """A single discrete milestone or phase in a task."""
 
     description: str
     status: StepStatus = StepStatus.PENDING
@@ -88,100 +110,108 @@ class Step:
         end = self.finished_at if self.finished_at else time.time()
         dur = max(0.0, end - self.started_at)
         if dur < 60:
-            return f"{int(dur)}s"
+            return f"{dur:.1f}s" if dur < 10 else f"{int(dur)}s"
         mins = int(dur // 60)
         secs = int(dur % 60)
-        return f"{mins}m {secs}s"
+        return f"{mins}m{secs:02d}s"
 
 
 class _StepIconWidget(QWidget):
-    """Custom paint widget rendering timeline connectors and animated step node icons."""
+    """Timeline node + trailing connector, custom-painted.
+
+    ``next_status`` colors the connector — see the module docstring.
+    """
 
     def __init__(
         self,
         status: StepStatus = StepStatus.PENDING,
-        is_first: bool = False,
         is_last: bool = False,
+        next_status: Optional[StepStatus] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.status = status
-        self.is_first = is_first
         self.is_last = is_last
-        self.pulse_radius_offset = 0
-        self.setFixedSize(28, 32)
+        self.next_status = next_status
+        self.pulse_offset = 0
+        self.setFixedWidth(_ICON_W)
 
-    def set_status(self, status: StepStatus, is_first: bool, is_last: bool) -> None:
+    def set_state(
+        self,
+        status: StepStatus,
+        is_last: bool,
+        next_status: Optional[StepStatus],
+    ) -> None:
         self.status = status
-        self.is_first = is_first
         self.is_last = is_last
+        self.next_status = next_status
         self.update()
 
     def set_pulse_offset(self, offset: int) -> None:
-        self.pulse_radius_offset = offset
+        self.pulse_offset = offset
         self.update()
 
+    def _connector_color(self) -> str:
+        if self.next_status == StepStatus.DONE:
+            return theme.SUCCESS_BORDER
+        if self.next_status == StepStatus.RUNNING:
+            return theme.ACCENT_PALE
+        if self.next_status == StepStatus.FAILED:
+            return theme.DANGER_BORDER
+        return theme.BORDER
+
     def paintEvent(self, _event) -> None:  # noqa: N802
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
 
-        cx = 14
-        cy = 16
+        cx = _ICON_W // 2
+        cy = _NODE // 2 + 4
+        r = _NODE // 2
 
-        # Draw vertical timeline connector line
-        if not (self.is_first and self.is_last):
-            pen = QPen(QColor(theme.BORDER), 1)
-            painter.setPen(pen)
-            if not self.is_first:
-                painter.drawLine(cx, 0, cx, cy - 8)
-            if not self.is_last:
-                painter.drawLine(cx, cy + 8, cx, 32)
+        # Trailing connector — runs from under this node to the widget bottom.
+        if not self.is_last:
+            p.setPen(QPen(QColor(self._connector_color()), 2))
+            p.drawLine(cx, cy + r + 3, cx, self.height())
 
-        # Draw Node Icon by Status
         if self.status == StepStatus.DONE:
-            # Green checkmark circle
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(theme.SUCCESS))
-            painter.drawEllipse(cx - 8, cy - 8, 16, 16)
-
-            painter.setPen(QPen(QColor("#FFFFFF"), 2))
-            painter.drawLine(cx - 4, cy, cx - 1, cy + 3)
-            painter.drawLine(cx - 1, cy + 3, cx + 4, cy - 3)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(theme.SUCCESS))
+            p.drawEllipse(cx - r, cy - r, _NODE, _NODE)
+            p.setPen(QPen(QColor("#FFFFFF"), 2))
+            p.drawLine(cx - 5, cy, cx - 1, cy + 4)
+            p.drawLine(cx - 1, cy + 4, cx + 5, cy - 4)
 
         elif self.status == StepStatus.RUNNING:
-            # Pulsing Indigo ring + solid core
-            painter.setPen(Qt.NoPen)
-            halo_color = QColor(theme.ACCENT)
-            halo_color.setAlpha(45)
-            painter.setBrush(halo_color)
-            r_halo = 9 + self.pulse_radius_offset
-            painter.drawEllipse(cx - r_halo, cy - r_halo, r_halo * 2, r_halo * 2)
+            halo = QColor(theme.ACCENT)
+            halo.setAlpha(40)
+            p.setPen(Qt.NoPen)
+            p.setBrush(halo)
+            hr = r + 3 + self.pulse_offset
+            p.drawEllipse(cx - hr, cy - hr, hr * 2, hr * 2)
 
-            painter.setBrush(QColor(theme.ACCENT))
-            painter.drawEllipse(cx - 6, cy - 6, 12, 12)
-
-            painter.setBrush(QColor(theme.SURFACE))
-            painter.drawEllipse(cx - 2, cy - 2, 4, 4)
+            p.setBrush(QColor(theme.ACCENT))
+            p.drawEllipse(cx - r, cy - r, _NODE, _NODE)
+            p.setBrush(QColor("#FFFFFF"))
+            p.drawEllipse(cx - 3, cy - 3, 7, 7)
 
         elif self.status == StepStatus.FAILED:
-            # Red cross circle
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(theme.DANGER))
-            painter.drawEllipse(cx - 8, cy - 8, 16, 16)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(theme.DANGER))
+            p.drawEllipse(cx - r, cy - r, _NODE, _NODE)
+            p.setPen(QPen(QColor("#FFFFFF"), 2))
+            p.drawLine(cx - 4, cy - 4, cx + 4, cy + 4)
+            p.drawLine(cx + 4, cy - 4, cx - 4, cy + 4)
 
-            painter.setPen(QPen(QColor("#FFFFFF"), 2))
-            painter.drawLine(cx - 3, cy - 3, cx + 3, cy + 3)
-            painter.drawLine(cx + 3, cy - 3, cx - 3, cy + 3)
+        else:  # PENDING — hollow ring
+            p.setPen(QPen(QColor(theme.BORDER_INPUT), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(cx - r + 1, cy - r + 1, _NODE - 2, _NODE - 2)
 
-        else:  # PENDING
-            # Subtle hollow circle
-            painter.setPen(QPen(QColor(theme.BORDER_INPUT), 1.5))
-            painter.setBrush(QColor(theme.SURFACE))
-            painter.drawEllipse(cx - 5, cy - 5, 10, 10)
+        p.end()
 
 
 class _StepRowWidget(QFrame):
-    """Row widget representing one individual step."""
+    """One step: node + connector on the left, description + timing on the right."""
 
     def __init__(
         self,
@@ -193,186 +223,172 @@ class _StepRowWidget(QFrame):
         super().__init__(parent)
         self.step = step
         self.index = index
-        self.setObjectName("stepRow")
+        self.setStyleSheet("background: transparent;")
+        # Fixed vertically, or the rail's QVBoxLayout hands each row an equal
+        # share of the leftover height: four steps in an 800px rail become
+        # four ~160px rows with the connector stretched between them, instead
+        # of a compact list at the top.
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 6, 12, 6)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        # Icon & connector
-        self.icon_widget = _StepIconWidget(
-            status=step.status, is_first=(index == 0), is_last=is_last
-        )
+        self.icon_widget = _StepIconWidget(status=step.status, is_last=is_last)
         layout.addWidget(self.icon_widget)
 
-        # Text column (description + optional detail)
         text_col = QVBoxLayout()
-        text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(2)
+        text_col.setContentsMargins(0, 3, 0, 10)
+        text_col.setSpacing(1)
 
         self.desc_label = QLabel(step.description)
+        self.desc_label.setWordWrap(True)
         self.desc_label.setTextInteractionFlags(Qt.NoTextInteraction)
         text_col.addWidget(self.desc_label)
 
-        self.detail_label = QLabel("")
-        self.detail_label.setTextInteractionFlags(Qt.NoTextInteraction)
-        self.detail_label.setStyleSheet(
-            f"color:{theme.TEXT_SECONDARY}; font-size:11px; font-style:italic;"
-        )
-        self.detail_label.hide()
-        text_col.addWidget(self.detail_label)
+        self.meta_label = QLabel("")
+        self.meta_label.setWordWrap(True)
+        self.meta_label.setTextInteractionFlags(Qt.NoTextInteraction)
+        text_col.addWidget(self.meta_label)
 
         layout.addLayout(text_col, stretch=1)
 
-        # Elapsed time badge
-        self.elapsed_label = QLabel(step.elapsed())
-        self.elapsed_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.elapsed_label.setStyleSheet(
-            f"color:{theme.TEXT_SECONDARY}; font-size:11px; font-weight:600; padding: 2px 6px; "
-            f"background:{theme.INPUT_BG}; border-radius: 4px;"
-        )
-        layout.addWidget(self.elapsed_label)
+        self.refresh(is_last=is_last, next_status=None)
 
-        self.refresh(is_last=is_last)
-
-    def refresh(self, is_last: bool) -> None:
+    def refresh(self, is_last: bool, next_status: Optional[StepStatus]) -> None:
         self.desc_label.setText(self.step.description)
-        self.icon_widget.set_status(self.step.status, is_first=(self.index == 0), is_last=is_last)
+        self.icon_widget.set_state(self.step.status, is_last, next_status)
+        self.setMinimumHeight(_ROW_MIN_H)
 
-        if self.step.progress_detail:
-            self.detail_label.setText(f"↳ {self.step.progress_detail}")
-            self.detail_label.show()
-        else:
-            self.detail_label.hide()
-
-        elapsed = self.step.elapsed()
-        self.elapsed_label.setText(elapsed)
-        self.elapsed_label.setVisible(bool(elapsed))
-
-        # Styling
-        if self.step.status == StepStatus.RUNNING:
-            self.setStyleSheet(
-                f"#stepRow {{ background: {theme.ACCENT_LIGHT}; border: 1px solid {theme.ACCENT_BORDER}; border-radius: {theme.RADIUS_SM}px; }}"
-            )
+        status = self.step.status
+        if status == StepStatus.RUNNING:
             self.desc_label.setStyleSheet(
-                f"color: {theme.ACCENT}; font-size: 13px; font-weight: 700;"
+                f"color:{theme.ACCENT};font-size:12px;font-weight:700;background:transparent;"
             )
-            self.elapsed_label.setStyleSheet(
-                f"color:{theme.ACCENT}; font-size:11px; font-weight:700; padding: 2px 6px; "
-                f"background:#E0E7FF; border-radius: 4px;"
+            meta = self.step.progress_detail or "Running…"
+            self.meta_label.setStyleSheet(
+                f"color:{theme.ACCENT};font-size:10px;background:transparent;"
             )
-        elif self.step.status == StepStatus.DONE:
-            self.setStyleSheet("#stepRow { background: transparent; border: 1px solid transparent; }")
+        elif status == StepStatus.DONE:
             self.desc_label.setStyleSheet(
-                f"color: {theme.TEXT_PRIMARY}; font-size: 13px; font-weight: 500;"
+                f"color:{theme.TEXT_PRIMARY};font-size:12px;font-weight:600;background:transparent;"
             )
-            self.elapsed_label.setStyleSheet(
-                f"color:{theme.TEXT_SECONDARY}; font-size:11px; font-weight:600; padding: 2px 6px; "
-                f"background:{theme.INPUT_BG}; border-radius: 4px;"
+            meta = self.step.elapsed()
+            self.meta_label.setStyleSheet(
+                f"color:{theme.TEXT_TERTIARY};font-size:10px;background:transparent;"
             )
-        elif self.step.status == StepStatus.FAILED:
-            self.setStyleSheet(f"#stepRow {{ background: {theme.DANGER_BG}; border: 1px solid {theme.DANGER_BORDER}; border-radius: {theme.RADIUS_SM}px; }}")
+        elif status == StepStatus.FAILED:
             self.desc_label.setStyleSheet(
-                f"color: {theme.DANGER_TEXT}; font-size: 13px; font-weight: 600;"
+                f"color:{theme.DANGER_TEXT};font-size:12px;font-weight:600;background:transparent;"
             )
-            self.elapsed_label.setStyleSheet(
-                f"color:{theme.DANGER_TEXT}; font-size:11px; font-weight:700; padding: 2px 6px; "
-                f"background:#FEE2E2; border-radius: 4px;"
+            meta = self.step.progress_detail or "Failed"
+            self.meta_label.setStyleSheet(
+                f"color:{theme.DANGER_TEXT};font-size:10px;background:transparent;"
             )
         else:  # PENDING
-            self.setStyleSheet("#stepRow { background: transparent; border: 1px solid transparent; }")
             self.desc_label.setStyleSheet(
-                f"color: {theme.TEXT_TERTIARY}; font-size: 13px; font-weight: 400;"
+                f"color:{theme.TEXT_TERTIARY};font-size:12px;font-weight:500;background:transparent;"
             )
-            self.elapsed_label.setStyleSheet(
-                f"color:{theme.TEXT_TERTIARY}; font-size:11px; font-weight:600; padding: 2px 6px; "
-                f"background:{theme.INPUT_BG}; border-radius: 4px;"
+            meta = ""
+            self.meta_label.setStyleSheet(
+                f"color:{theme.TEXT_TERTIARY};font-size:10px;background:transparent;"
             )
 
+        self.meta_label.setText(meta)
+        self.meta_label.setVisible(bool(meta))
 
-class StepTracker(QWidget):
-    """Visual task step progress tracker with animations and live elapsed time."""
+
+class StepTracker(QFrame):
+    """Fixed-width step rail for the right edge of the Workbench.
+
+    Always visible: `reset()` returns it to the placeholder state rather than
+    hiding it, so the output pane beside it never reflows.
+    """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setObjectName("stepTrackerContainer")
+        self.setObjectName("stepRail")
+        self.setFixedWidth(theme.STEP_SIDEBAR_W)
+        self.setStyleSheet(
+            f"#stepRail {{ background: {theme.SURFACE};"
+            f" border-left: 1px solid {theme.BORDER}; }}"
+        )
+
         self.steps: list[Step] = []
         self._step_widgets: list[_StepRowWidget] = []
         self._animations: list[QPropertyAnimation] = []
         self._pulse_high = True
 
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 18, 16, 16)
+        root.setSpacing(0)
 
-        # Outer card container
-        self.card = QFrame()
-        self.card.setObjectName("stepTrackerCard")
-        self.card.setStyleSheet(
-            f"#stepTrackerCard {{ background: {theme.SURFACE}; "
-            f"border-radius: {theme.RADIUS_MD}px; }}"
+        # -- Header: "STEPS" + n/total ---------------------------------------
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+
+        title = QLabel("STEPS")
+        title.setStyleSheet(
+            f"font-size:10px;font-weight:700;color:{theme.TEXT_TERTIARY};"
+            f"letter-spacing:0.8px;background:transparent;"
         )
-        theme.apply_drop_shadow(self.card, 'sm')
-        card_layout = QVBoxLayout(self.card)
-        card_layout.setContentsMargins(16, 20, 16, 20)
-        card_layout.setSpacing(6)
+        header.addWidget(title)
+        header.addStretch()
 
-        # Header bar
-        header_h = QHBoxLayout()
-        header_h.setContentsMargins(4, 0, 4, 0)
-        header_h.setSpacing(8)
-
-        self.title_label = QLabel("TASK PROGRESSION")
-        self.title_label.setStyleSheet(
-            f"font-size: 11px; font-weight: 800; color: {theme.TEXT_SECONDARY}; letter-spacing: 0.8px;"
+        self.count_label = QLabel("")
+        self.count_label.setStyleSheet(
+            f"font-size:10px;font-weight:600;color:{theme.TEXT_SECONDARY};background:transparent;"
         )
-        header_h.addWidget(self.title_label)
+        self.count_label.hide()
+        header.addWidget(self.count_label)
 
-        self.badge_count = QLabel("")
-        self.badge_count.setStyleSheet(
-            f"font-size: 11px; font-weight: 700; color: {theme.ACCENT}; background: {theme.ACCENT_LIGHT}; "
-            f"border: 1px solid {theme.ACCENT_BORDER}; border-radius: 10px; padding: 2px 8px;"
+        root.addLayout(header)
+        root.addSpacing(16)
+
+        # -- Empty placeholder ------------------------------------------------
+        self.placeholder = QWidget()
+        ph_lay = QVBoxLayout(self.placeholder)
+        ph_lay.setContentsMargins(0, 0, 0, 0)
+        ph_lay.setSpacing(8)
+        ph_lay.setAlignment(Qt.AlignCenter)
+
+        ph_icon = QLabel("○")
+        ph_icon.setAlignment(Qt.AlignCenter)
+        ph_icon.setStyleSheet(
+            f"font-size:22px;color:{theme.BORDER_INPUT};background:transparent;"
         )
-        self.badge_count.hide()
-        header_h.addWidget(self.badge_count)
+        ph_lay.addWidget(ph_icon)
 
-        header_h.addStretch()
-
-        self.status_pill = QLabel("Running")
-        self.status_pill.setStyleSheet(
-            f"font-size: 11px; font-weight: 600; color: {theme.TEXT_SECONDARY}; padding: 2px 6px;"
+        ph_text = QLabel("Steps will appear here\nwhen a task runs")
+        ph_text.setAlignment(Qt.AlignCenter)
+        ph_text.setWordWrap(True)
+        ph_text.setStyleSheet(
+            f"font-size:11px;color:{theme.TEXT_TERTIARY};background:transparent;"
         )
-        self.status_pill.hide()
-        header_h.addWidget(self.status_pill)
+        ph_lay.addWidget(ph_text)
 
-        card_layout.addLayout(header_h)
+        root.addWidget(self.placeholder, stretch=1)
 
-        # Scroll area for compactness
+        # -- Scrollable step list ---------------------------------------------
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.NoFrame)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.scroll_area.setStyleSheet(
-            "QScrollArea { background: transparent; border: none; }"
-            "QScrollBar:vertical { width: 6px; background: transparent; margin: 0; }"
-            f"QScrollBar::handle:vertical {{ background: {theme.BORDER}; border-radius: 3px; }}"
-            f"QScrollBar::handle:vertical:hover {{ background: {theme.TEXT_TERTIARY}; }}"
-        )
-        self.scroll_area.setMaximumHeight(200)
+        self.scroll_area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
 
-        self.inner_widget = QWidget()
-        self.inner_widget.setStyleSheet("background: transparent;")
-        self._layout = QVBoxLayout(self.inner_widget)
-        self._layout.setContentsMargins(0, 4, 0, 4)
-        self._layout.setSpacing(4)
+        self.inner = QWidget()
+        self.inner.setStyleSheet("background: transparent;")
+        self._layout = QVBoxLayout(self.inner)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(0)
         self._layout.addStretch()
 
-        self.scroll_area.setWidget(self.inner_widget)
-        card_layout.addWidget(self.scroll_area)
-        root_layout.addWidget(self.card)
+        self.scroll_area.setWidget(self.inner)
+        self.scroll_area.hide()
+        root.addWidget(self.scroll_area, stretch=1)
 
-        # Timers
+        # -- Timers ------------------------------------------------------------
         self._pulse_timer = QTimer(self)
         self._pulse_timer.timeout.connect(self._pulse_active)
         self._pulse_timer.start(500)
@@ -381,19 +397,23 @@ class StepTracker(QWidget):
         self._elapsed_timer.timeout.connect(self._update_elapsed)
         self._elapsed_timer.start(1000)
 
-        self.hide()  # Hidden until first step arrives or task starts
+    # -- state ---------------------------------------------------------------
 
     def reset(self) -> None:
-        """Clear all steps for a new task."""
+        """Clear all steps and return to the placeholder. Never hides the rail."""
         self.steps.clear()
         self._animations.clear()
         for w in self._step_widgets:
             self._layout.removeWidget(w)
             w.deleteLater()
         self._step_widgets.clear()
-        self.badge_count.hide()
-        self.status_pill.hide()
-        self.hide()
+        self.count_label.hide()
+        self.scroll_area.hide()
+        self.placeholder.show()
+
+    def _activate(self) -> None:
+        self.placeholder.hide()
+        self.scroll_area.show()
 
     def handle_marker(self, marker_type: str, description: str, detail: str = "") -> None:
         """Process a parsed [STEP:XXX] marker."""
@@ -408,16 +428,15 @@ class StepTracker(QWidget):
                     if not s.finished_at:
                         s.finished_at = time.time()
 
-            pending_step = None
-            for s in self.steps:
-                if s.status == StepStatus.PENDING and s.description == description:
-                    pending_step = s
-                    break
-
-            if pending_step:
-                pending_step.status = StepStatus.RUNNING
-                pending_step.started_at = time.time()
-                pending_step.is_inferred = False
+            pending = next(
+                (s for s in self.steps
+                 if s.status == StepStatus.PENDING and s.description == description),
+                None,
+            )
+            if pending:
+                pending.status = StepStatus.RUNNING
+                pending.started_at = time.time()
+                pending.is_inferred = False
             else:
                 step = Step(
                     description=description,
@@ -427,77 +446,55 @@ class StepTracker(QWidget):
                 )
                 self.steps.append(step)
                 self._add_step_widget(step)
-
-            self.show()
+            self._activate()
 
         elif marker_type == "DONE":
-            found = False
-            for s in self.steps:
-                if s.description == description and s.status == StepStatus.RUNNING:
-                    s.status = StepStatus.DONE
-                    s.finished_at = time.time()
-                    found = True
-                    break
-            if not found:
-                for s in self.steps:
-                    if s.status == StepStatus.RUNNING:
-                        s.status = StepStatus.DONE
-                        s.finished_at = time.time()
-                        break
+            target = next(
+                (s for s in self.steps
+                 if s.description == description and s.status == StepStatus.RUNNING),
+                None,
+            ) or next((s for s in self.steps if s.status == StepStatus.RUNNING), None)
+            if target:
+                target.status = StepStatus.DONE
+                target.finished_at = time.time()
 
         elif marker_type == "FAIL":
-            found = False
-            for s in self.steps:
-                if s.description == description and s.status == StepStatus.RUNNING:
-                    s.status = StepStatus.FAILED
-                    s.finished_at = time.time()
-                    s.progress_detail = detail
-                    found = True
-                    break
-            if not found:
-                for s in self.steps:
-                    if s.status == StepStatus.RUNNING:
-                        s.status = StepStatus.FAILED
-                        s.finished_at = time.time()
-                        s.progress_detail = detail
-                        break
+            target = next(
+                (s for s in self.steps
+                 if s.description == description and s.status == StepStatus.RUNNING),
+                None,
+            ) or next((s for s in self.steps if s.status == StepStatus.RUNNING), None)
+            if target:
+                target.status = StepStatus.FAILED
+                target.finished_at = time.time()
+                target.progress_detail = detail
 
         elif marker_type == "PROGRESS":
-            found = False
-            for s in self.steps:
-                if s.description == description and s.status == StepStatus.RUNNING:
-                    s.progress_detail = detail
-                    found = True
-                    break
-            if not found:
-                for s in self.steps:
-                    if s.status == StepStatus.RUNNING:
-                        s.progress_detail = detail
-                        break
+            target = next(
+                (s for s in self.steps
+                 if s.description == description and s.status == StepStatus.RUNNING),
+                None,
+            ) or next((s for s in self.steps if s.status == StepStatus.RUNNING), None)
+            if target:
+                target.progress_detail = detail
 
         self._refresh_all_widgets()
         self._scroll_to_bottom()
 
     def handle_tool_call(self, tool_name: str, args_preview: str = "") -> None:
-        """Auto-infer steps from tool calls if no explicit step is active."""
-        clean_tool = tool_name.strip().lower()
-        description = _TOOL_STEP_MAP.get(clean_tool)
-        if not description:
-            description = f"Executing {clean_tool.replace('_', ' ')}"
+        """Infer a step from a tool call when no explicit marker is active."""
+        clean = tool_name.strip().lower()
+        description = _TOOL_STEP_MAP.get(clean) or f"Executing {clean.replace('_', ' ')}"
 
-        running_step: Step | None = None
-        for s in self.steps:
-            if s.status == StepStatus.RUNNING:
-                running_step = s
-                break
-
-        if running_step is not None:
-            if not running_step.is_inferred:
+        running = next((s for s in self.steps if s.status == StepStatus.RUNNING), None)
+        if running is not None:
+            # An explicit marker outranks inference: never displace a real step.
+            if not running.is_inferred:
                 return
-            if running_step.description == description:
+            if running.description == description:
                 return
-            running_step.status = StepStatus.DONE
-            running_step.finished_at = time.time()
+            running.status = StepStatus.DONE
+            running.finished_at = time.time()
 
         step = Step(
             description=description,
@@ -507,15 +504,16 @@ class StepTracker(QWidget):
         )
         self.steps.append(step)
         self._add_step_widget(step)
-        self.show()
+        self._activate()
+
+    # -- widgets --------------------------------------------------------------
 
     def _add_step_widget(self, step: Step) -> None:
-        idx = len(self._step_widgets)
-        widget = _StepRowWidget(step, index=idx, is_last=True)
+        widget = _StepRowWidget(step, index=len(self._step_widgets), is_last=True)
 
-        opacity_effect = QGraphicsOpacityEffect(widget)
-        widget.setGraphicsEffect(opacity_effect)
-        anim = QPropertyAnimation(opacity_effect, b"opacity")
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity")
         anim.setDuration(240)
         anim.setStartValue(0.0)
         anim.setEndValue(1.0)
@@ -530,32 +528,18 @@ class StepTracker(QWidget):
 
     def _refresh_all_widgets(self) -> None:
         total = len(self._step_widgets)
-        done_count = sum(1 for s in self.steps if s.status == StepStatus.DONE)
-        running_count = sum(1 for s in self.steps if s.status == StepStatus.RUNNING)
-        failed_count = sum(1 for s in self.steps if s.status == StepStatus.FAILED)
+        done = sum(1 for s in self.steps if s.status == StepStatus.DONE)
 
         for idx, w in enumerate(self._step_widgets):
-            is_last = (idx == total - 1)
-            w.refresh(is_last=is_last)
+            is_last = idx == total - 1
+            next_status = None if is_last else self.steps[idx + 1].status
+            w.refresh(is_last=is_last, next_status=next_status)
 
-        if total > 0:
-            self.badge_count.setText(f"{done_count}/{total} complete")
-            self.badge_count.show()
-
-            if running_count > 0:
-                self.status_pill.setText("Running ●")
-                self.status_pill.setStyleSheet(f"color:{theme.ACCENT}; font-size:11px; font-weight:700;")
-                self.status_pill.show()
-            elif failed_count > 0:
-                self.status_pill.setText("Failed ✗")
-                self.status_pill.setStyleSheet(f"color:{theme.DANGER_TEXT}; font-size:11px; font-weight:700;")
-                self.status_pill.show()
-            elif done_count == total:
-                self.status_pill.setText("All steps complete ✓")
-                self.status_pill.setStyleSheet(f"color:{theme.SUCCESS_TEXT}; font-size:11px; font-weight:700;")
-                self.status_pill.show()
-            else:
-                self.status_pill.hide()
+        if total:
+            self.count_label.setText(f"{done}/{total}")
+            self.count_label.show()
+        else:
+            self.count_label.hide()
 
     def _pulse_active(self) -> None:
         self._pulse_high = not self._pulse_high
@@ -567,9 +551,11 @@ class StepTracker(QWidget):
     def _update_elapsed(self) -> None:
         for w in self._step_widgets:
             if w.step.status == StepStatus.RUNNING:
-                elapsed = w.step.elapsed()
-                w.elapsed_label.setText(elapsed)
-                w.elapsed_label.setVisible(bool(elapsed))
+                w.refresh(
+                    is_last=(w is self._step_widgets[-1]),
+                    next_status=None if w is self._step_widgets[-1]
+                    else self.steps[w.index + 1].status,
+                )
 
     def _scroll_to_bottom(self) -> None:
         QTimer.singleShot(
