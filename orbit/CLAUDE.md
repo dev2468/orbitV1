@@ -181,9 +181,11 @@ Note the first LiteLLM call takes ~18s (warm-up) and subsequent ones ~1s — not
   This bites test fixtures and anything that assumes it behaves like the FTS path.
 - `get_daily_cost` sums `events.cost_usd` for a tool_call within a day, meant to be checked *before*
   spending rather than after so a cap actually stops spend. It has **no callers anywhere in this
-  codebase** — its one caller was the voice runtime's daily transcription-cost cap, removed along
-  with all voice code. Left in `db.py` as generic infrastructure (nothing about its implementation
-  is voice-specific); the next cost-capped tool_call is what would call it next, not a rebuild.
+  codebase** — its one caller was the old voice runtime's daily transcription-cost cap, removed with
+  that code. **Voice has since been rebuilt (`gui/voice.py`) and does not restore the cap**, so
+  Deepgram streaming currently bills per minute of audio with nothing watching the total. That makes
+  this function's most obvious caller a live gap rather than a hypothetical one. Nothing about its
+  implementation is voice-specific — it caps any tool_call.
 - Event logging is duplicated across `policy.py` and `orbit/tools/foundation.py` (Fix 7 pending);
   `tests/CLAUDE.md` has the rule that follows from it.
 
@@ -224,6 +226,24 @@ task nobody is watching.
 `screenshot_path` stores a **path, not the image**. Base64 PNGs of every confirmation would grow this
 DB without bound, and the GUI can read a file.
 
-**Nothing writes to this table yet** — Phase 4 (REPL confirm) and Phase 5 (GUI approve/reject) are
-what call it. `CREATE TABLE IF NOT EXISTS` in `_SCHEMA` is the entire migration story, which works
-because `init_db()` runs at every entry point (`run_task`, every MCP server, the GUI, conftest).
+**The channel is fully wired now** — an earlier revision of this file said nothing wrote to this
+table, which is no longer true. `orbit/confirmation.py` is the writer:
+`request_confirmation()` records the row **before** asking anyone, then asks either the console
+(`y/N`) or the GUI approvals drawer, and resolves the row either way. That ordering is what makes
+the audit trail complete — a refusal leaves a REJECTED row, an unattended run leaves a REJECTED row,
+and a crash mid-prompt leaves a PENDING row a human can still see, rather than all three being
+indistinguishable from "never happened".
+
+The consumer is `windows_control_tools._require_confidence`, which validates the token **inside the
+tool process** via `db.consume_approval_token` rather than trusting whatever the caller passed. So
+the round trip a vision-guessed click now takes is: below-floor element → `request_confirmation` →
+human yes → single-use token → `_require_confidence` spends it → the one action runs. The floor and
+the element's confidence are untouched throughout; see the root `CLAUDE.md`'s vision section, which
+is the canonical description of that path.
+
+`_console_is_interactive()` decides which channel is used. With no TTY it waits on the GUI for
+`approval_gui_wait_seconds` — **0 by default**, so unattended runs fail closed immediately instead of
+hanging. `prompt` is injectable so `tests/test_confirmation_flow.py` can drive decisions without a TTY.
+
+`CREATE TABLE IF NOT EXISTS` in `_SCHEMA` is the entire migration story, which works because
+`init_db()` runs at every entry point (`run_task`, every MCP server, the GUI, conftest).
