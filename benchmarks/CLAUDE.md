@@ -51,8 +51,9 @@ split so the *shape* of the report stays comparable even though the numbers are 
 ## What it reuses from the real tool, and why that is load-bearing
 
 `grounding_bench.py` imports `_parse_vision_reply`, `_vision_point_to_screen`,
-`_fit_for_inline_upload`, `_nim_api_key` and `_VISION_MODEL` from `perception_tools.py` rather than
-reimplementing them. A benchmark that reimplements what it benchmarks measures the reimplementation
+`_fit_for_inline_upload`, `_openrouter_api_key` and `_VISION_MODEL` from `perception_tools.py` rather
+than reimplementing them. (That credential helper was `_nim_api_key` before the project moved to
+OpenRouter — the import in the code is current; only this line had lagged.) A benchmark that reimplements what it benchmarks measures the reimplementation
 — it would report a healthy number while the real parser rejected every reply.
 
 As of Phase 2 that extends to the whole set-of-mark path: `benchmarks/overlay.py` imports the

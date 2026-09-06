@@ -303,13 +303,16 @@ here"); that spike has been run against 10 real screenshots and 46 targets on th
 its outcome and the decision it produced live in the VISION TIER comment block at the top of the
 vision code in `perception_tools.py` — next to the code, not in a separate document that would rot.
 
-The short version of what the spike decided: the model is `nvidia_nim/google/gemma-4-31b-it`, called
-by the tool itself via its own LiteLLM call (not through the orchestrating agent's model, which is
-not multimodal). Asked with no output format imposed, it answers in Gemma's native pointing format —
-`{"point": [y, x]}` normalised 0-1000, y first — every time, sometimes wrapped in prose or a fence,
-so the point object is matched wherever it appears. Preprocessing is: resolve window → capture
-through the shared `_grab_png` path → crop to the window's bounds → downscale **only** if the base64
-exceeds NVIDIA's documented ~180,000-char inline ceiling → base64 PNG. Coordinate translation
+The short version of what the spike decided: the tool makes its **own** LiteLLM call to a multimodal
+model rather than going through the orchestrating agent's model, which is not multimodal. The model
+is `_VISION_MODEL` in `perception_tools.py` — today `openrouter/google/gemma-3-27b-it`. (The spike
+itself ran against `nvidia_nim/google/gemma-4-31b-it`; the whole project has since moved to
+OpenRouter, so that name survives only inside the historical VISION TIER comment block.) Asked with
+no output format imposed, Gemma answers in its native pointing format — `{"point": [y, x]}`
+normalised 0-1000, y first — every time, sometimes wrapped in prose or a fence, so the point object
+is matched wherever it appears. Preprocessing is: resolve window → capture through the shared
+`_grab_png` path → crop to the window's bounds → downscale **only** if the base64 exceeds the
+provider's inline ceiling (~180,000 chars) → base64 PNG. Coordinate translation
 reverses the resize then the crop, in that order, and is round-tripped against a synthetic
 crop/resize in the tests because an off-by-the-crop-origin bug produces plausible-looking answers
 that are wrong by a small constant.
@@ -323,15 +326,23 @@ Two traps worth knowing before touching this code:
 - **The server subprocess has no API key.** `orbit/skills/*.py` spawn these servers with
   `env={"ORBIT_TASK_ID": ...}`, and mcp's `StdioServerParameters` uses that dict *instead of*
   inheriting the parent environment — so unlike `orbit/agent.py`, this process starts with no
-  `NVIDIA_NIM_API_KEY`. `_nim_api_key()` loads the project `.env` itself, by a path resolved from
-  the module file rather than the cwd.
+  `OPENROUTER_API_KEY`. `_openrouter_api_key()` loads the project `.env` itself, by a path resolved
+  from the module file rather than the cwd. (It was `_nim_api_key()` before the move to OpenRouter;
+  the mechanism and the reason for it are unchanged.)
 
-**The vision tier is read-only and structurally cannot actuate.** Its `ElementRef` carries
-`Confidence.VISION_INFERRED` (0.50), below `windows_control_policy.yaml`'s `min_actuation_confidence`
-(0.70), so `windows_click`/`windows_drag` refuse it exactly as they refuse a raw `{x, y}`. That is
-the invariant the whole feature had to avoid breaking, and it is pinned by
+**The vision tier never auto-actuates.** Its `ElementRef` carries `Confidence.VISION_INFERRED`
+(0.50), below `windows_control_policy.yaml`'s `min_actuation_confidence` (0.70), so
+`windows_click`/`windows_drag` refuse it exactly as they refuse a raw `{x, y}`. That is the invariant
+the whole feature had to avoid breaking, and it is pinned by
 `test_vision_sourced_element_ref_is_still_refused_by_actuation` against the real policy file and the
 real `_resolve_click_target` — not a stand-in.
+
+An earlier revision of this file said the tier "structurally cannot actuate". That is no longer the
+whole truth: `orbit/confirmation.py` now gives a human a way to approve **one** below-floor action,
+and `_require_confidence` accepts the resulting single-use token. The floor is unchanged, the
+element's confidence is unchanged, and nothing special-cases `source="vision"` — what a token buys is
+per-action permission for the single call a human actually looked at. Read the root `CLAUDE.md`'s
+vision section for the full path; it is canonical.
 
 **`perception_find_element` now resolves two tiers, and vision is opt-in.** It fires only when the
 caller passes `tier_order=["uia","vision"]` *and* a `query.description`; it never falls back to

@@ -13,7 +13,9 @@ pywin32
 # module docstring for the OCR/vision-tier libraries deliberately NOT added.
 mss
 PySide6
-# Voice pipeline: Deepgram Nova-3 (STT) + Aura-2 (TTS) over WebSocket.
+# Voice input: Deepgram Nova-3 streaming STT over WebSocket (gui/voice.py).
+# Input only — there is no TTS in this build and no Aura/Kokoro dependency.
+# sounddevice captures the mic; numpy computes the RMS that drives the orb.
 deepgram-sdk
 sounddevice
 numpy

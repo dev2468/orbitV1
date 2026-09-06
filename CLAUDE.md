@@ -72,11 +72,44 @@ voice uses it. Both live in `.env`.
 - Override per-run with `ORBIT_MODEL` in `.env`; `--list-models` prints the catalog and the active
   model.
 
+**Effort** (`ORBIT_EFFORT`, the GUI's Low/Medium/High selector, and the `effort` field in a
+`--serve` JSON line) is **not** a reasoning-effort parameter in the provider sense. It selects a
+temperature and token ceiling from `_EFFORT_CONFIGS` in `agent.py`: low `0.3/4096`, medium
+`0.5/8192`, high `0.7/16384`. It defaults to `low`, and an unrecognised value falls back to `low`
+rather than erroring. So "high effort" buys a longer leash and more variance, not a different
+thinking mode.
+
 ⚠️ **`gpt-6-astra` is not in `KNOWN_MODELS`, and `gemini-3.7-flash`'s entry there still says
 "Default."** So `--list-models` currently reports `Active: openrouter/openai/gpt-6-astra` while
 labelling a different model as the default. Whichever way that experiment settles, fix the catalog
 with it — `KNOWN_MODELS` is also the list of models verified to support tool calling, and one that
 does not cannot drive this agent at all.
+
+## Setup
+
+What a machine needs before any command below will work. On an already-set-up box this is all done —
+skip to Commands.
+
+1. **Windows.** Not portable, and not incidentally so: windows-control drives real mouse/keyboard
+   through `pywinauto`/`pywin32`, and screen-perception reads the UI Automation tree. Those have no
+   cross-platform equivalent here. The browser, memory and filesystem tools would port; the parts
+   that make Orbit *Orbit* would not.
+2. **Python 3.13.7**, one venv at `venv/`. `venv\Scripts\python.exe -m pip install -r requirements.txt`.
+   `requirements.txt` carries a comment on every non-obvious pin — read them before changing one,
+   especially the `mcp>=1.24,<2` pin, which is not stylistic (see Stack).
+3. **Node, for `npx`.** The browser tools spawn `npx -y @playwright/mcp@latest` per session. Nothing
+   vendors it; without Node the browser toolset fails at first use, not at import.
+4. **`.env` in the project root:**
+   - `OPENROUTER_API_KEY` — required. Every agent and vision call goes through it.
+   - `DEEPGRAM_API_KEY` — only for F9 voice. Absent, voice prints a diagnostic and does nothing;
+     everything else runs.
+   - `ORBIT_MODEL` — optional per-run model override.
+5. **Dev-MCP's external server**, if you want that toolset to start —
+   `C:\Users\HP\Desktop\MCP\server.py` with its own venv. It is **not** in this repo and is
+   hardcoded. See Distance to the north star; this is the step a fresh clone cannot complete.
+
+First run is slower than it looks and neither pause is a hang: LiteLLM's first call takes ~18s to
+warm up (subsequent ~1s), and Playwright's `npx` cold start takes ~60s.
 
 ## Commands
 

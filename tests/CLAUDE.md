@@ -1,16 +1,27 @@
 # tests/ — philosophy, fixtures, and the real-DB trap
 
-286 tests across sixteen files (285 collected into the default run + 1 opt-in). The vision work added
-five: `test_grounding_bench.py` (the benchmark's deterministic half), `test_candidate_source.py`
-(candidate generation), `test_set_of_mark.py` (set-of-mark grounding), and
-`test_pending_confirmations.py` (the approval data model) and `test_confirmation_flow.py` (the REPL/GUI approval channel, with the
-console asker injected so none of it needs a TTY). None of the five makes a real model call —
-`test_grounding_bench.py` drives the harness in `--dry-run`, and the set-of-mark tests monkeypatch
-`_call_vision_model` exactly as the older vision tests do. `test_foundation.py`,
-`test_policy.py`, `test_memory_tools.py`, `test_browser_policy_tools.py`, `test_filesystem_tools.py`,
-`test_windows_control_tools.py`, `test_communication_tools.py`, `test_uia_resolver.py` and
-`test_perception_tools.py` are unit tests of individual pieces; `test_adversarial.py` probes whether
-the *system* holds under attack.
+**354 tests across 21 test files** (`pytest tests/ -q` collects them all; one file,
+`test_windows_control_live.py`, skips itself unless opted in).
+
+Grouped by what they are for:
+
+- **Unit tests of individual pieces** — `test_foundation.py`, `test_policy.py`,
+  `test_memory_tools.py`, `test_browser_policy_tools.py`, `test_filesystem_tools.py`,
+  `test_windows_control_tools.py`, `test_communication_tools.py`, `test_uia_resolver.py`,
+  `test_perception_tools.py`.
+- **Vision work** — `test_grounding_bench.py` (the benchmark's deterministic half, driven in
+  `--dry-run`), `test_candidate_source.py`, `test_set_of_mark.py`. None makes a real model call; the
+  set-of-mark tests monkeypatch `_call_vision_model` exactly as the older vision tests do.
+- **The approval channel** — `test_pending_confirmations.py` (the data model: token minting, expiry,
+  single use) and `test_confirmation_flow.py` (the REPL/GUI channel, with the console asker injected
+  so none of it needs a TTY).
+- **GUI** — `test_gui_launch.py` (the window constructs and tabs switch), `test_history_view.py`
+  (filtering, selection, KPI wiring), `test_step_tracker.py` (marker parsing, tool-call inference,
+  the rail's placeholder/list states), `test_stats.py` (the analytics arithmetic — pure logic, no
+  QApplication needed).
+- **Cost** — `test_llm_cost.py` pins the context-compaction and prompt-cache machinery, because
+  every one of those fails *silently*: the task still succeeds and the only symptom is a bigger bill.
+- **System under attack** — `test_adversarial.py` probes whether the whole stack holds, not one piece.
 
 **`test_windows_control_live.py` is skipped by default** (`ORBIT_RUN_LIVE_UI_TESTS` unset) and is not
 part of `pytest tests/ -q`. Unlike every other "not hermetic" test here, it doesn't just need network

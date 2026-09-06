@@ -62,8 +62,15 @@ The `planned:` block at the bottom is commented out on purpose. Those names (`wi
 unimplemented tools made the config look more complete than the system is — exactly the gap this
 file exists to prevent. Uncomment a name only when its tool actually exists.
 
-`high` is currently empty, and that is consistent: nothing reachable is high-tier, and a high-tier
-tool would be blocked outright anyway since no confirmation channel exists.
+`high` is currently empty, and that is consistent: nothing reachable is high-tier, and
+`SafetyPlugin.before_tool_callback` blocks `high` outright with `confirmation_required` rather than
+ever auto-approving it.
+
+Note that this is **not** the same channel as `pending_confirmations`. That one
+(`orbit/confirmation.py`) exists and works, but it covers a different question — a *below-floor
+actuation target*, asked at the tool boundary. Tier `high` is a property of the **tool** and is
+refused earlier, in the plugin, with no ask attached. Wiring `high` to the approval channel would be
+a real design change, not a rename; do not assume the existing channel already covers it.
 
 ## chrome_profiles.yaml is a consent boundary
 
