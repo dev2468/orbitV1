@@ -36,8 +36,10 @@ Working today, verified:
   box. Modal with commit/discard exits.
 - **Warm worker**: the GUI spawns one `run_task --serve` process and feeds it goals over stdin,
   removing ~7-8s of cold start per task.
-- **Six MCP servers**: browser-policy, memory, filesystem, windows-control, communication,
-  screen-perception.
+- **Seven toolsets**: six MCP servers in this repo (browser-policy, memory, filesystem,
+  windows-control, communication, screen-perception) plus **Dev-MCP**, which proxies a server
+  living *outside* the repo and gives the agent sandboxed PowerShell and broad file access. Every
+  task carries Dev-MCP, in both lanes.
 - **Vision tier**: implemented, and — new — a human can now approve a single vision-guessed action.
 - **354 tests collected**, all passing except opt-in live-UI ones. Some hit the network and cost
   tokens; see `tests/CLAUDE.md`.
@@ -121,7 +123,9 @@ process stays up between goals.
                        ├──▶ filesystem server ────────▶ data/fs_workspace (scoped)
                        ├──▶ windows-control server ───▶ real mouse/keyboard (lane="foreground" only)
                        ├──▶ communication server ─────▶ swappable MailBackend (today: local SQLite stand-in)
-                       └──▶ screen-perception server ─▶ read-only: UIA tree, screenshots (mss), vision
+                       ├──▶ screen-perception server ─▶ read-only: UIA tree, screenshots (mss), vision
+                       └──▶ Dev-MCP (EXTERNAL) ───────▶ C:\Users\HP\Desktop\MCP\server.py — outside
+                                                        this repo, own venv. PowerShell + file access.
 
   Human-in-the-loop:  windows_control tool ──▶ orbit/confirmation.py ──▶ pending_confirmations table
                                                        │                         ▲
@@ -213,6 +217,87 @@ passes `tier_order=["uia","vision"]` and a `query.description`, never automatica
 Reasons are on `FindElementTool` — chiefly that it turns a millisecond-scale local lookup into a
 hosted model call, and that the two tiers do not take the same kind of input.
 
+## Module map
+
+Every source file and what it is for. 49 files; the ones with no entry here are `__init__.py`.
+Directory-level detail lives in that directory's own `CLAUDE.md` (next section).
+
+### `orbit/` — core runtime
+
+| File | Purpose |
+| --- | --- |
+| `agent.py` | Builds the one `LlmAgent`: model selection, the instruction, and which toolsets the lane gets. `build_agent(lane=…)` is the enforcement point for the foreground gate. |
+| `run_task.py` | The single execution path. REPL, one-shot CLI and `--serve` all funnel into `run_task()`. |
+| `task_manager.py` | Two-lane scheduler — foreground is a single-flight lock (one mouse), headless a semaphore(5). |
+| `policy.py` | `SafetyPlugin`: the allowlist check, tier gate, retry caps, failure classification, and history compaction. Every tool call passes through it. |
+| `db.py` | SQLite store — tasks, events, memory, `pending_confirmations`, `ui_memory`. Owns the FTS5 triggers and the approval-token rules. |
+| `confirmation.py` | Human-in-the-loop approval for actions the confidence gate refuses. Writes the row, asks console or GUI, mints the single-use token. |
+| `degradation.py` | The user-facing message when the provider call dies. |
+| `tools/foundation.py` | `BaseTool` / `ToolResult` / `ToolError`. Timeout, cancellation, redaction and event logging live in `execute()` so a tool author cannot skip them. |
+| `tools/element_ref.py` | `ElementRef` — the shape perception produces and windows-control consumes. Carries the `confidence` the actuation gate reads. |
+
+### `orbit/mcp_servers/` — the only surface the model can reach
+
+Each server is a thin FastMCP wrapper; the `_tools.py` beside it holds the real `BaseTool` bodies.
+That split is deliberate — the server handles protocol, the tools module handles behaviour.
+
+| File | Purpose |
+| --- | --- |
+| `browser_policy_server.py` / `_tools.py` | Proxies Playwright MCP behind URL policy. Spawns a Playwright subprocess per session. |
+| `windows_control_server.py` / `_tools.py` | Real mouse/keyboard actuation. Holds `_require_confidence` — the floor and the approval-token escape. |
+| `perception_server.py` / `_tools.py` | Read-only screen observation: UIA tree, screenshots, and the vision tier. |
+| `memory_server.py` / `_tools.py` | The agent's access to its own task history. |
+| `filesystem_server.py` / `_tools.py` | Scoped read/write inside `data/fs_workspace`. |
+| `communication_server.py` / `_tools.py` | Email/calendar surface. `email_send` is blocked. |
+| `communication_backend.py` | The swappable `MailBackend`. Today a working local SQLite stand-in; no real inbox. |
+| `uia_resolver.py` | The **one** UIA implementation, shared by perception and windows-control so they cannot drift into two lookalike resolvers. |
+| `candidate_source.py` | Generates candidate boxes for the vision tier. |
+| `mark_overlay.py` | Draws the numbered boxes for set-of-mark prompts, straight into the raw RGB buffer. `benchmarks/raster.py` imports it rather than copying it — one renderer, or the benchmark measures something the tool does not do. |
+
+### `orbit/skills/` — toolset wiring
+
+Each module is a `build_toolset(task_id)` returning a configured `MCPToolset`: which server to spawn,
+which `tool_filter` to expose, and how `ORBIT_TASK_ID` reaches the subprocess. A tool absent from a
+skill's `tool_filter` is invisible to the model regardless of what the server implements.
+
+| File | Wraps | Loaded in lane |
+| --- | --- | --- |
+| `memory.py` | memory — the agent's own task history | both |
+| `screen_perception.py` | screen-perception — read-only observation | both |
+| `devmcp.py` | **an external server outside this repo** — PowerShell + file access | both |
+| `windows_control.py` | windows-control — real mouse/keyboard | **foreground only** |
+| `research_product.py` | browser-policy — Playwright web research | **headless only** |
+| `filesystem.py` | filesystem — scoped `fs_workspace` sandbox | headless only |
+| `communication.py` | communication — email/calendar | headless only |
+
+**The two lanes load genuinely different agents, not the same one with a flag.** Foreground adds
+windows-control and then *drops* browser-policy, filesystem and communication — deliberately, for two
+different reasons. Browser: a foreground task is told to drive real Chrome through windows-control,
+so the 14 Playwright tool declarations would burn ~5K tokens per call on tools the instruction
+forbids. Filesystem: desktop work uses Dev-MCP against the user's real files, not the scoped
+sandbox, so both would be redundant *and* ambiguous about which one to reach for.
+
+`windows_control.py` being absent from headless is the visibility half of the lane gate — a headless
+agent has no function declaration for `windows_click` at all, so it cannot call it, full stop.
+`devmcp.py` is the one to know about; see Distance to the north star.
+
+### `gui/` — PySide6 dashboard
+
+| File | Purpose |
+| --- | --- |
+| `main.py` | The window: nav, input card, output pane, overlays, warm-worker plumbing. |
+| `theme.py` | Every design token and the master QSS. Widgets import from here; none defines its own colors. |
+| `step_tracker.py` | The 220px right-hand step rail. |
+| `history_view.py` | History tab — KPI tiles, filters, task list, inspector. |
+| `stats.py` | Pure arithmetic behind the KPIs and every duration string. No Qt, so it is testable without a widget tree. |
+| `voice.py` | F9 hotkey, Deepgram session, the orb, and the voice modal. |
+
+### `benchmarks/` and `eval/`
+
+`grounding_bench.py` runs the vision accuracy benchmark over `fixtures.py`'s synthetic scenes, drawn
+by `raster.py` + `overlay.py`, configured by `config.py`. `eval/run_eval.py` is the separate
+end-to-end harness against live sites.
+
 ## Where to look
 
 | Read this when you are touching… | File |
@@ -247,6 +332,15 @@ how much they block the goal.
 - **Vision is the USP but has no trustworthy accuracy number.** The only figure that exists (76%) is
   from a dataset that was never committed. `benchmarks/` is the intended replacement and should be
   run and reported before anyone claims a number publicly.
+- **Dev-MCP hardcodes a path outside the repo, and every task loads it.**
+  `orbit/skills/devmcp.py` spawns `C:\Users\HP\Desktop\MCP\server.py` — a server that is not in this
+  repository, has its own Python 3.14 venv, and exists only on the author's machine. It is wired into
+  **both** lanes in `build_agent`, so a fresh clone gets a toolset it cannot start, and the tools it
+  exposes (`run_command` — PowerShell — plus `read_file`/`write_file` over arbitrary paths) are among
+  the most powerful in the system. Its four tools *are* registered in `risk_tiers.yaml`, so invariant
+  3 holds and nothing is bypassing policy. But for the open-source goal this is a hard blocker in two
+  ways: the path must be vendored or made configurable, and the capability needs documenting rather
+  than arriving as a surprise. This is the largest single obstacle to anyone else running Orbit.
 - **No LICENSE and no README.** The project is meant to be open source and currently has neither, so
   it is not actually publishable. A license choice is the user's call, not one to make by default.
 - **The communication server has no real mailbox.** `LocalMailBackend` is a genuinely working local
