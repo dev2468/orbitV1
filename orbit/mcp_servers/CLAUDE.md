@@ -1,11 +1,13 @@
 # orbit/mcp_servers/ — the MCP servers
 
-Six FastMCP servers, each a thin wrapper whose every tool call goes through a `BaseTool`:
+Seven FastMCP servers, each a thin wrapper whose every tool call goes through a `BaseTool`:
 `browser-policy` (proxy over Playwright MCP), `memory` (over `orbit/db.py`), `filesystem` (over the
 real local filesystem, scoped by `orbit/config/filesystem_policy.yaml`), `windows-control` (real
 mouse/keyboard actuation via pywinauto/pywin32, gated by `orbit/config/windows_control_policy.yaml`),
-`communication` (email/calendar, against a swappable backend — see its own section below), and
-`screen-perception` (read-only screen/UI observation — see its own section below). Each
+`communication` (email/calendar, against a swappable backend — see its own section below),
+`screen-perception` (read-only screen/UI observation — see its own section below), and `devmcp`
+(PowerShell plus local file access behind `orbit/config/devmcp_policy.yaml`, vendored in-repo on
+2026-09-08). Each
 `*_server.py` is the process entry point; each `*_tools.py` holds the implementations so they are
 unit-testable without the stdio transport. `uia_resolver.py` is neither of those — it's a shared,
 non-server module both `windows-control` and `screen-perception` import (see the screen-perception
@@ -174,8 +176,10 @@ be scoped the way a file path can:
    any target below `windows_control_policy.yaml`'s `min_actuation_confidence` (default 0.70) with
    `permission_denied`, checked *before* `windows_click`/`windows_drag` touch pywinauto at all. Raw
    `{x, y}` coordinates are always scored at `Confidence.VISION_INFERRED` (0.50) by
-   `_resolve_click_target`, so they never clear that floor — there is no confirm channel to route a
-   guessed click through, so this is a hard stop, not Section 7's softer "reverify" state. This reuses
+   `_resolve_click_target`, so they never clear that floor on their own. The sanctioned way past it is
+   a human's single-use approval token (`orbit/confirmation.py`), spent inside this process. The one
+   unguarded path is `ClickTool`'s bare-`{x, y}` branch, taken only when an operator sets
+   `confirm_raw_coordinate_clicks: false`; it is off as shipped. This reuses
    `orbit.tools.foundation.Confidence`'s existing constants/threshold rather than inventing new ones.
 2. **A fail-closed key-combo denylist** (`_is_blocked_combo`) for `windows_key` — Alt+F4,
    Ctrl+Alt+Delete, Win+L are refused outright regardless of tier, the same "enforce inside the tool,
@@ -194,7 +198,7 @@ match was meant — same philosophy as `GetPolicyTool`'s refusal to guess a chro
 
 **`_resolve_click_target` (still local to `windows_control_tools.py`) is Contract 3's actual
 completion point.** `windows_click`/`windows_drag`'s `target` argument accepts three shapes now, not
-two: raw `{x, y}` (always vision-tier, always refused), a locator (`{window_handle, automation_id/
+two: raw `{x, y}` (always vision-tier; refused without an approval token), a locator (`{window_handle, automation_id/
 name}`, resolved fresh via `resolve_uia_element`), or — new — an ALREADY-resolved `ElementRef` dict
 (has `bounds`/`source`/`confidence` keys already set, e.g. straight out of a prior
 `perception_find_element` call), used as-is with no second UIA round-trip. That third case is what

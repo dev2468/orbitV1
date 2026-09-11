@@ -131,11 +131,12 @@ browser content, and `perception_server.py`'s node pruning and screenshot-to-dis
 `orbit/mcp_servers/CLAUDE.md`. `tests/test_llm_cost.py` pins all of it, because every one of these
 fails silently: the task still succeeds and the only symptom is a larger bill.
 
-**Sessions are already isolated per task.** `run_task()` builds a fresh `InMemoryRunner` and a new
-session keyed by `task_id` for every goal, including each line typed at the REPL — so conversation
-history never carries from one task into the next. Adding "chat sessions" would not reduce tokens;
-the cost is entirely *within* a single task's turn loop, which is what the two mechanisms above
-address.
+**The turn loop is where the cost is, and a conversation makes it longer.** A one-off task gets a
+fresh `InMemoryRunner` and session; a conversation reuses one runner across its turns (see
+"Conversations reuse their runner" below), so its session — every earlier turn's tool calls and
+results — keeps growing. The two mechanisms above are what bound that: compaction elides stale large
+results, and the cache breakpoint keeps the unchanged prefix cheap. Nothing bounds a session beyond
+them; a very long conversation still re-sends everything that has not been compacted.
 
 ## The adhoc- task row and the foreign key that forces it
 
@@ -312,8 +313,9 @@ the element's confidence are untouched throughout; see the root `CLAUDE.md`'s vi
 is the canonical description of that path.
 
 `_console_is_interactive()` decides which channel is used. With no TTY it waits on the GUI for
-`approval_gui_wait_seconds` — **0 by default**, so unattended runs fail closed immediately instead of
-hanging. `prompt` is injectable so `tests/test_confirmation_flow.py` can drive decisions without a TTY.
+`approval_gui_wait_seconds` — 0 when the key is absent (fail closed immediately), 30 in the shipped
+YAML, after which an unanswered request is refused. `prompt` is injectable so
+`tests/test_confirmation_flow.py` can drive decisions without a TTY.
 
 `CREATE TABLE IF NOT EXISTS` in `_SCHEMA` is the entire migration story, which works because
 `init_db()` runs at every entry point (`run_task`, every MCP server, the GUI, conftest).

@@ -1,6 +1,6 @@
 # orbit/skills/ — MCPToolset wiring
 
-Six modules, each a single `build_toolset(task_id="")` returning an `MCPToolset`. A skill is the
+Seven modules, each a single `build_toolset(task_id="")` returning an `MCPToolset`. A skill is the
 orchestrator's vocabulary: it composes atomic tools, and its `tool_filter` is an *enforced*
 allowlist, not documentation.
 
@@ -70,9 +70,9 @@ other two, not because that second layer alone would be insufficient.
 
 **`communication.py` and `screen_perception.py` need no lane gating**, unlike `windows_control.py` —
 neither simulates OS input, so both are wired into `orbit/agent.py` unconditionally (`lane="headless"`),
-the same as `memory.py`/`filesystem.py`. `screen_perception.py` exposes all 5 of its implemented tools —
-unlike every other skill here, there's no held-back tool: nothing in this server is high-tier or
-otherwise unreachable, so there's nothing to hold back.
+the same as `memory.py`/`filesystem.py`. `screen_perception.py` exposes 8 tools — the six
+`perception_*` tools plus `ui_memory_lookup`/`ui_memory_upsert` — and, unlike every other skill
+here, holds none back: nothing it serves is high-tier or otherwise unreachable.
 
 **Adding a name to a `tool_filter` without adding it to `orbit/config/risk_tiers.yaml` is a hard
 block at runtime and a test failure at build time** —

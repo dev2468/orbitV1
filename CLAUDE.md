@@ -50,7 +50,7 @@ Working today, verified:
   in-repo on 2026-09-08 with the policy layer the external version turned out to be missing. Every
   task carries devmcp, in both lanes.
 - **Vision tier**: implemented, and — new — a human can now approve a single vision-guessed action.
-- **552 tests collected**, all passing except one opt-in live-UI test. Some hit the network and cost
+- **556 tests collected**, all passing except one opt-in live-UI test. Some hit the network and cost
   tokens; see `tests/CLAUDE.md`.
 
 **Voice integration exists, in both directions.** Earlier revisions of this file said voice was
@@ -145,19 +145,28 @@ warm up (subsequent ~1s), and Playwright's `npx` cold start takes ~60s.
 
 ## Where the time goes
 
-Measured 2026-09-08 on the author's machine, warm worker. Re-measure before trusting any of it;
-these numbers moved by 5-8x in two days and will move again.
+Measured 2026-09-11 with `benchmarks/two_track_bench.py pipeline`: the real worker, the real
+acknowledgement and real Aura synthesis, 6 repetitions, one turn at a time, gemini-2.5-flash on both
+tracks, simple local goals (no browsing). Seconds **from submission** — on the voice path, add the
+0.9s auto-submit (`ORBIT_AUTO_SUBMIT_MS`) in front of every row. Re-measure before trusting any of
+it; these numbers moved 5-8x in a week.
 
-| | |
-| --- | --- |
-| Transcript → auto-submit | 0.9s (`ORBIT_AUTO_SUBMIT_MS`) |
-| Ack model call, classification | ~1.0s (its first tokens) |
-| Ack complete → Deepgram Aura → **first spoken word** | **~2.2-4.0s total** |
-| **A purely social turn ends here** | **~3.4-4.0s**, no work track at all |
-| MCP connect, 6 servers in parallel | 1.3s |
-| Work track answer, trivial goal | ~5.4s |
-| Work track answer, one tool call | ~10-12s |
-| Answer → spoken summary | ~1.1s |
+| | median | p10-p90 | n |
+| --- | --- | --- | --- |
+| Routing decision — the acknowledgement's first tokens | 1.04 | 0.99-1.38 | 30 |
+| **Social turn ends** (acknowledgement complete, no work track) | **1.09** | 1.03-1.44 | 30 |
+| Social turn, first audio | 1.43 | 1.32-1.83 | 30 |
+| The same social goals sent straight to the agent instead | 5.56 | 4.05-6.52 | 12 |
+| **Task turn, first audio** | **2.31** | 1.34-2.89 | 17 |
+| Task turn, work-track answer | 7.29 | 4.44-11.82 | 18 |
+| Conversation, first-turn answer | 5.39 | 4.81-7.34 | 6 |
+| Conversation, follow-up answer (runner reused) | 2.99 | 2.67-5.63 | 12 |
+
+On a task turn the first audio lands ~0.9s later than on a social one. The likely cause is the
+worker starting its MCP servers on the same CPU at that moment; it has not been isolated.
+
+Single measurements from 2026-09-08 that the benchmark does not cover: MCP connect for 6 servers in
+parallel, 1.3s; an answer needing one real tool call, ~10-12s; answer → spoken summary, ~1.1s.
 
 Three fixes account for most of it, and each is documented where it lives:
 
@@ -187,7 +196,7 @@ venv\Scripts\python.exe -m orbit.run_task find the cheapest 65 inch tv   # one-s
 venv\Scripts\python.exe -m orbit.run_task --foreground open notepad ...  # opts into lane=foreground — the ONLY way windows-control tools are reachable (one-shot only, not inside the REPL)
 venv\Scripts\python.exe -m orbit.run_task --serve                        # warm-worker mode: reads one JSON goal per line from stdin. What the GUI spawns; not meant to be typed at by hand
 venv\Scripts\python.exe -m orbit.run_task --list-models                  # known-good models + active one
-venv\Scripts\python.exe -m pytest tests\ -q                              # 552 tests (some hit the network; a live-UI windows-control test is opt-in, see tests/CLAUDE.md)
+venv\Scripts\python.exe -m pytest tests\ -q                              # 556 tests (some hit the network; a live-UI windows-control test is opt-in, see tests/CLAUDE.md)
 venv\Scripts\python.exe -m eval.run_eval                                 # eval harness against live sites
 ```
 
@@ -206,15 +215,15 @@ questions on different timescales:
       │
       ├──▶ ACK TRACK   orbit/ack.py + gui/ack_controller.py + gui/speech.py
       │      one small model, NO tools, ~400-token prompt
-      │      classifies [CHAT]/[TASK] at ~1s, spoken at ~2.2s
+      │      classifies [CHAT]/[TASK] at ~1.0s, first audio ~1.4-2.3s
       │                      │
       │                      └── [CHAT] ──▶ the work track never runs.
-      │                                     A social turn ends here, ~3.4s.
+      │                                     A social turn ends here, ~1.1s.
       │
       └──▶ WORK TRACK  orbit/run_task.py --serve  (everything below)
              dispatched only once classified [TASK]
-             44 tools, ~8,000-token prompt, MCP connect ~3.3s
-             answer ~9s ──▶ spoken summary ~1.1s later
+             44 tools, ~8,000-token prompt, MCP connect ~1.3s
+             answer ~7s on simple goals ──▶ spoken summary ~1.1s later
 ```
 
 The ack track exists because the work track cannot be made fast enough to
@@ -243,7 +252,8 @@ Rules that keep it honest:
 
 The ack's first tokens are `[CHAT]` or `[TASK]`, and the work track is **held
 until that arrives** (~1s). A social turn therefore never spawns six MCP
-servers: "thanks, that was great" finishes in ~3.4s instead of ~9s.
+servers: a social turn ends ~1.1s after submission, where sending the same
+goal to the agent takes ~5.6s (measured; see "Where the time goes").
 
 **A real task must never fail to be dispatched.** Every failure path —
 classification error, provider timeout, no marker at all, an unparseable
@@ -255,6 +265,16 @@ made silently does nothing.
 If the classification is wrong anyway, the goal is left in the input box and
 re-submitting it verbatim forces the work track. That is the recovery path,
 and it is why it needs no new widget.
+
+**Measured 2026-09-11** (`benchmarks/two_track_bench.py classify`: 170
+labelled utterances, 3 repeats each, gemini-2.5-flash). 461 of 468 labelled
+calls were routed correctly (98.5%, 95% CI 96.9-99.3%). The dangerous error, a
+task routed CHAT, happened in 2 of 258 task calls (0.8%), both on one
+borderline memory question: "how many tasks did you finish today?". The other
+five errors went the safe way. Two of those were replies with no marker at
+all, which fell to TASK exactly as designed; 508 of 510 replies carried one.
+The labels are drafted, not independently reviewed — see
+`benchmarks/ack_utterances.json` before quoting this anywhere.
 
 ### Why the spoken summary is a second model call
 
@@ -377,8 +397,15 @@ Every constraint on that path is load-bearing, and none of them relaxes the floo
 - it is **single-use** and **bound to one row**, so one yes can never authorise a second click;
 - it is validated **inside the tool process** via `db.consume_approval_token`, not trusted from the
   caller, so a replayed copy is refused;
-- unattended runs **fail closed** — `approval_gui_wait_seconds` defaults to 0, and nobody answering
-  is a no.
+- unattended runs **fail closed** — with no console to ask on, the GUI gets
+  `approval_gui_wait_seconds` to answer (30 in the shipped YAML; 0, meaning no wait at all, when the
+  key is absent), and nobody answering is a no;
+- **a raw `{x, y}` click takes the same path.** A bare point the model picked off a screenshot is
+  scored `VISION_INFERRED` and needs its own yes, exactly like a vision guess. The one exception is an
+  operator opt-in, `confirm_raw_coordinate_clicks: false`, which lets `windows_click` send a bare
+  point to the mouse unasked, for screenshot-driven control on a machine someone is watching. It is
+  off as shipped. It was on from 2026-08-28 to 2026-09-11, which quietly broke Invariant 7, and
+  `tests/test_windows_control_tools.py` now reads the real policy file to keep it off.
 
 `tests/test_perception_tools.py::test_vision_sourced_element_ref_is_still_refused_by_actuation` pins
 the refusal against the real policy file and resolver, and

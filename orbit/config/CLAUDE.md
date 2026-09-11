@@ -62,7 +62,8 @@ The `planned:` block at the bottom is commented out on purpose. Those names (`wi
 unimplemented tools made the config look more complete than the system is — exactly the gap this
 file exists to prevent. Uncomment a name only when its tool actually exists.
 
-`high` is currently empty, and that is consistent: nothing reachable is high-tier, and
+`high` holds three implemented tools — `fs_delete`, `windows_focus_window`, `email_send` — and none
+of them is reachable: each is held out of its skill's `tool_filter`, and
 `SafetyPlugin.before_tool_callback` blocks `high` outright with `confirmation_required` rather than
 ever auto-approving it.
 
@@ -123,15 +124,22 @@ which can't be sandboxed the way a file path can. Two knobs stand in for that:
 
 `blocked_key_combos` is matched after canonicalizing (lowercase, sort, `+`-join), so `"Alt+F4"`,
 `"alt+f4"`, and `"f4+alt"` all match one entry. Refused outright (`permission_denied`) rather than
-queued for confirmation, same fail-closed default as `url_policy.yaml`'s blocklist — there's no
-confirm channel to route these through instead. Widen carefully; it's specifically what stops
-`windows_key` from closing an app or locking/interrupting the session out from under the user.
+queued for confirmation, same fail-closed default as `url_policy.yaml`'s blocklist — the
+confirmation channel covers below-floor click targets only, never these. Widen carefully; it's
+specifically what stops `windows_key` from closing an app or locking/interrupting the session out
+from under the user.
 
 `min_actuation_confidence` (default 0.70) reuses `orbit.tools.foundation.Confidence`'s existing
 "surface" boundary rather than introducing a second number. Any `ElementRef` — UIA, OCR, vision, or
 the raw-`{x, y}` path (always scored at `Confidence.VISION_INFERRED`) — below this is refused by
-`windows_click`/`windows_drag`. Since no confirm channel exists, this is a hard stop today, not
-Section 7's softer "reverify" state.
+`windows_click`/`windows_drag` unless the call carries a human's single-use approval token
+(`orbit/confirmation.py`; see `approval_token_ttl_seconds` and `approval_gui_wait_seconds`).
+
+`confirm_raw_coordinate_clicks` is `true` as shipped: a bare `{x, y}` is asked about like any other
+below-floor target. `false` is an operator opt-in for screenshot-driven control that lets
+`windows_click` send a bare point to the mouse with no check and no token — the only path in the
+build that moves the mouse without a human's yes. It was `false` from 2026-08-28 to 2026-09-11;
+`tests/test_windows_control_tools.py` now reads this file to keep it `true`.
 
 ## communication_policy.yaml
 

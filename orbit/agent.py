@@ -48,6 +48,7 @@ from orbit.models import (  # noqa: F401
     KNOWN_MODELS,
     _REQUIRED_KEY_BY_PREFIX,
     short_model_name,
+    resolve_model_name,
     validate_model_key,
 )
 from orbit.skills import communication as communication_skill
@@ -668,7 +669,7 @@ _EFFORT_CONFIGS = {
 def select_model(
     model_name: str | None = None, effort: str | None = None
 ) -> LiteLlm:
-    model_name = model_name or os.environ.get("ORBIT_MODEL") or DEFAULT_MODEL
+    model_name = resolve_model_name(model_name)
     effort = (effort or os.environ.get("ORBIT_EFFORT", "low")).lower()
     extra = _EFFORT_CONFIGS.get(effort, _EFFORT_CONFIGS["low"])
     return LiteLlm(

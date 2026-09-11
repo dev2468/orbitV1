@@ -17,6 +17,7 @@ from google.genai import types as genai_types
 
 from orbit import db
 from orbit.agent import build_agent, validate_model_key
+from orbit.models import resolve_model_name
 from orbit.degradation import graceful_degradation_message
 from orbit.safety_plugin import SafetyPlugin
 from orbit.task_manager import TaskManager
@@ -234,6 +235,11 @@ async def run_task(
     task_id = db.create_task(
         title, goal=goal, lane=lane, risk_tier=risk_tier,
         conversation_id=conversation_id,
+        # The model this task actually runs on, resolved exactly as
+        # select_model() resolves it. Nothing passed this before 2026-09-11,
+        # so every earlier row has NULL here and the task log cannot be split
+        # by model.
+        model=resolve_model_name(model),
     )
     if conversation_id:
         db.add_turn_to_conversation(conversation_id, task_id)

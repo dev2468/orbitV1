@@ -415,16 +415,17 @@ def test_vision_sourced_element_ref_is_still_refused_by_actuation():
     perception_vision_locate returns — fed into windows-control's real
     target resolver must still be refused by the confidence gate.
 
-    NOTE: raw {x, y} dicts now bypass the gate entirely (direct coordinate
-    clicks). This test covers a DIFFERENT path: an already-resolved ElementRef
-    with source='vision' and confidence=VISION_INFERRED, which arrives through
-    _resolve_click_target's first branch (has bounds/source/confidence keys).
-    That path still hits _require_confidence and must be refused.
+    This covers the ElementRef path: an already-resolved ref with
+    source='vision' and confidence=VISION_INFERRED, which arrives through
+    _resolve_click_target's first branch (has bounds/source/confidence keys)
+    and must hit _require_confidence and be refused. Raw {x, y} dicts are
+    gated the same way as shipped; test_windows_control_tools.py pins that,
+    along with the operator opt-out that exempts them.
 
     Asserted against the REAL windows_control_policy.yaml floor and the REAL
     _resolve_click_target, not a stand-in: the point is that no path exists
-    from perception_vision_locate's output to a real mouse click without
-    the user explicitly supplying {x, y} coordinates themselves."""
+    from perception_vision_locate's output to a real mouse click without a
+    human's yes for that one action."""
     import orbit.mcp_servers.windows_control_tools as wc_tools
 
     vision_element = ElementRef(

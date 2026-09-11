@@ -5,52 +5,57 @@
 #
 # There is no scoped-roots equivalent here the way filesystem has one —
 # mouse/keyboard input lands wherever the real OS focus is, and that can't
-# be sandboxed the way a file path can. The two knobs this file actually
-# has are a fail-closed key-combo denylist and the confidence floor below
-# which no actuation is allowed to run at all.
+# be sandboxed the way a file path can. What stands in for it: a fail-closed
+# key-combo denylist, and a confidence floor below which no actuation runs
+# without a human's yes for that one action.
 
 # Matched after normalizing to lowercase, sorted, '+'-joined form, so
 # "Alt+F4" / "alt+f4" / "f4+alt" all match the same entry. Refused outright
-# with permission_denied — no confirm channel exists to route these
-# through instead, matching url_policy.yaml's fail-closed philosophy for
-# blocklisted URLs. Widen this list carefully; it exists specifically to
-# stop windows_key from being used to close an app or lock/interrupt the
-# session out from under the user.
+# with permission_denied — the confirmation channel (orbit/confirmation.py)
+# covers below-floor click targets only, never these — matching
+# url_policy.yaml's fail-closed philosophy for blocklisted URLs. Widen this
+# list carefully; it exists specifically to stop windows_key from being used
+# to close an app or lock/interrupt the session out from under the user.
 blocked_key_combos:
   - alt+f4
   - ctrl+alt+delete
   - ctrl+alt+del
   - win+l
 
-# Confidence.gate's own "surface" boundary (orbit/tools/foundation.py) is
-# reused here rather than inventing a second number: any resolved
-# ElementRef — UIA, OCR, vision, or the raw-{x,y} path (always scored at
-# Confidence.VISION_INFERRED) — below this is refused with
-# permission_denied by windows_click/windows_drag. There is no confirm
-# channel to route a low-confidence click through, so unlike the
-# "reverify" state Section 7 describes, anything under this line is a hard
-# stop today, not a softer retry path.
+# The "surface" threshold of orbit/tools/foundation.py's Confidence scale,
+# reused rather than inventing a second number: any resolved ElementRef —
+# UIA, OCR, vision, or the raw-{x,y} path (always scored at
+# Confidence.VISION_INFERRED) — below this is refused with permission_denied
+# by windows_click/windows_drag. The one way past it is a human's per-action
+# yes: orbit/confirmation.py asks, and a single-use, short-lived approval
+# token (approval_token_ttl_seconds below) lets exactly that action through.
+# Nothing raises a score or lowers this line to get a click past it.
 min_actuation_confidence: 0.70
 
-# Whether a raw {x, y} click has to be approved by a human before it lands.
+# Whether a raw {x, y} click needs a human's per-action approval.
 #
-# false here is a DELIBERATE operator choice, not an oversight. Vision-driven
-# desktop control is built out of coordinate clicks: the model takes a
-# screenshot, looks at it, and clicks what it sees, dozens of times in a
-# single task. Asking per click makes that mode unusable — the human ends up
-# rubber-stamping a prompt they have stopped reading, which is worse than no
-# prompt at all, because it looks like oversight and isn't.
+# true (shipped): a bare point the model picked by looking at a screenshot is
+# treated exactly like a vision-guessed element. It is scored
+# VISION_INFERRED, sits below min_actuation_confidence, and lands only with a
+# human's yes for that one click — the same ask, token and expiry that
+# perception_vision_locate's output goes through. This is Invariant 7 in the
+# root CLAUDE.md, and tests/test_windows_control_tools.py reads this file to
+# hold it.
 #
-# What this does NOT relax: an already-resolved ElementRef carrying a
+# false: an OPT-IN unsupervised mode for screenshot-driven control, where one
+# task issues dozens of coordinate clicks and a prompt per click is unusable —
+# the human ends up rubber-stamping prompts they have stopped reading. While
+# it is false, windows_click sends a bare {x, y} straight to the mouse with
+# no confidence check and no token: the model can click anywhere on screen
+# with nobody's yes. Only set it on a machine you are sitting at and watching,
+# and set it back afterwards.
+#
+# What false does NOT relax: an already-resolved ElementRef carrying a
 # below-floor `confidence` (e.g. straight out of perception_vision_locate)
-# still goes through the confirmation channel, and min_actuation_confidence
-# above still governs it. Only a bare {x, y} the model chose by looking at a
-# picture is covered here — the case where there is no resolver opinion to
-# check against in the first place.
-#
-# Set back to true for unattended or shared machines, where an unreviewed
-# click landing wherever focus happens to be is the bigger risk.
-confirm_raw_coordinate_clicks: false
+# still needs approval, windows_drag never takes the unsupervised path (a raw
+# endpoint there still needs an approval token), and windows_scroll refuses
+# raw coordinates regardless.
+confirm_raw_coordinate_clicks: true
 
 # How long a human approval stays usable, in seconds.
 #
@@ -70,9 +75,10 @@ approval_token_ttl_seconds: 120
 # How long to wait for the GUI dashboard to answer a confirmation when there
 # is no interactive console to ask on. 0 disables the GUI channel.
 #
-# Set to 30 to enable the GUI approval channel. The dashboard polls for
-# pending confirmations every 2 seconds and shows a screenshot with the
-# proposed click target drawn as a blue box — the human approves or rejects.
-# Set back to 0 for unattended runs (eval, CI) where a hang is worse than
-# a refusal.
+# The code default when this key is absent is 0 (orbit/confirmation.py), so a
+# config that predates it fails closed immediately. The shipped value is 30:
+# the dashboard polls for pending confirmations every 2 seconds and shows a
+# screenshot with the proposed click target drawn as a blue box, and an
+# unanswered request fails closed once the 30 seconds are up. Set back to 0
+# for unattended runs (eval, CI) where a hang is worse than a refusal.
 approval_gui_wait_seconds: 30

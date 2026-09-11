@@ -160,3 +160,42 @@ runner.
 One timestamped JSON per run under `benchmarks/results/` (gitignored — they are run artifacts, and
 they embed model replies). Phases are compared by diffing two of those files, which is why runs
 never overwrite each other.
+
+## A second harness: `two_track_bench.py`
+
+Unrelated to grounding. It measures the acknowledgement track (root `CLAUDE.md`, "Two tracks, not
+one") and shares nothing with the grounding harness except the results directory.
+
+```
+venv\Scripts\python.exe -m benchmarks.two_track_bench classify    # [CHAT]/[TASK] routing, 170 utterances x 3
+venv\Scripts\python.exe -m benchmarks.two_track_bench pipeline    # latency through the real worker, 6 reps
+```
+
+- **`classify`** sends every utterance in `ack_utterances.json` through the real `ack.stream_ack`
+  and `MarkerSplitter`, and routes each reply the way the GUI does: `[CHAT]` ends the turn, anything
+  else — including no marker and a failed call — dispatches the work. It reports the two error types
+  separately because they are not the same error: a task routed CHAT silently drops a request, chat
+  routed TASK costs one wasted worker turn. Its latencies are informational only; its calls run
+  concurrently.
+- **`pipeline`** drives the real `run_task --serve` worker, the real acknowledgement and real Aura
+  synthesis, one turn at a time, and mirrors `gui/main.py`'s deferred dispatch — including the
+  dispatch guard, whose value it reads from `gui/main.py`'s source rather than copying. It also runs
+  the counterfactual (social goals sent straight to the agent) and three-turn conversations.
+
+Rules that keep it honest:
+
+- **Labels were fixed from the acknowledgement prompt's written definitions before any run.**
+  AMBIGUOUS items are excluded from accuracy and reported only as the share routed TASK. The set was
+  drafted with an AI assistant and has not been independently reviewed; say so wherever the numbers
+  go.
+- **The pipeline's goals are local on purpose.** No browsing, so Playwright's ~60s cold start and a
+  slow website cannot pose as agent latency. It also means its answer times are for simple tasks —
+  say that too.
+- **It measures from submission.** Speech-to-text, the 0.9s auto-submit delay and audio-device
+  latency are outside it. Add the auto-submit when quoting a voice-path number.
+- **It writes to `data/orbit.db`**, like every run of the real worker. Its rows carry a
+  `conversation_id` starting `CONV-bench-`; exclude them from any analysis of real use.
+- **It imports what it measures**, for the reason the grounding harness does: `ack.stream_ack`,
+  `ack.MarkerSplitter`, `ack.recent_context`, and `gui/speech.py`'s voice and sample rate.
+
+First results are in the root `CLAUDE.md`, under "The classification" and "Where the time goes".

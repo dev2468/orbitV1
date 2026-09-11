@@ -69,14 +69,13 @@ always safe".
 
 `redact_secrets` walks dicts/lists/strings and blanks two ways: any *key* matching
 password/secret/token/api_key/credential/auth, and any *value* matching a known key shape. The
-value patterns include a bare `\b[0-9a-f]{32,40}\b` — added because Deepgram keys (the voice
-integration's STT provider, removed entirely on the `remove-voice-integration` branch) had no fixed
-prefix, were plain lowercase hex, and a real one obtained during that build was 40 chars even though
-the docs' own example was 32. The pattern stays even with Deepgram gone: it's generic hex-secret
-coverage, not Deepgram-specific, and it also matches a stray MD5/SHA-1 hash — over-redacting a hash
-is the accepted cost of not leaking a real key that appears outside a suspiciously-named field. Do
-not narrow it to 32 on the strength of a doc example, and do not remove it just because the
-integration that originally motivated it is gone.
+value patterns include a bare `\b[0-9a-f]{32,40}\b` — added because Deepgram keys have no fixed
+prefix, are plain lowercase hex, and a real one obtained during the first voice build was 40 chars
+even though the docs' own example was 32. Deepgram is the live voice provider again (Nova-3 in,
+Aura out — `gui/voice.py`, `gui/speech.py`), so this pattern protects a key the build actually
+holds. It is also generic hex-secret coverage and matches a stray MD5/SHA-1 hash — over-redacting a
+hash is the accepted cost of not leaking a real key that appears outside a suspiciously-named field.
+Do not narrow it to 32 on the strength of a doc example.
 
 ## Where the event row goes
 

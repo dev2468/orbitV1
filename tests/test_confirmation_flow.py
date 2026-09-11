@@ -107,8 +107,8 @@ def test_raw_coordinates_are_asked_about_when_the_knob_is_on(monkeypatch):
 
 
 def test_raw_coordinates_proceed_when_the_knob_is_off(monkeypatch):
-    """With the knob OFF (what the shipped YAML sets, for vision-driven
-    control), a bare {x, y} proceeds without asking."""
+    """With the knob OFF — an operator opt-in for screenshot-driven control,
+    not the shipped setting — a bare {x, y} proceeds without asking."""
     monkeypatch.setattr(
         confirmation, "load_windows_control_policy",
         lambda: _policy(confirm_raw_coordinate_clicks=False),
@@ -116,6 +116,14 @@ def test_raw_coordinates_proceed_when_the_knob_is_off(monkeypatch):
     assert confirmation.target_needs_confirmation(
         "windows_click", {"target": {"x": 100, "y": 200}}
     ) is None
+
+
+def test_the_shipped_policy_asks_about_raw_coordinates():
+    """Invariant 7 against the real policy file: as shipped, a bare {x, y}
+    click is asked about, exactly like a vision guess."""
+    assert confirmation.target_needs_confirmation(
+        "windows_click", {"target": {"x": 100, "y": 200}}
+    ) is not None
 
 
 def test_turning_the_raw_coord_knob_off_does_not_relax_a_below_floor_elementref(monkeypatch):

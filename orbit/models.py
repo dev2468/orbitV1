@@ -84,6 +84,17 @@ def short_model_name(full_name: str) -> str:
     return full_name.rsplit("/", 1)[-1] if "/" in full_name else full_name
 
 
+def resolve_model_name(model_name: str | None = None) -> str:
+    """The model a task will actually run on: an explicit choice, else
+    ORBIT_MODEL, else DEFAULT_MODEL.
+
+    One definition, used by `agent.select_model` to build the model and by
+    `run_task` to record it on the task row, so the recorded model cannot
+    drift from the one that ran.
+    """
+    return model_name or os.environ.get("ORBIT_MODEL") or DEFAULT_MODEL
+
+
 def validate_model_key(model_name: str | None = None) -> None:
     """Raise RuntimeError if the chosen model's API key is missing.
 
@@ -92,7 +103,7 @@ def validate_model_key(model_name: str | None = None) -> None:
     an API call is even attempted. run_task calls this explicitly before
     submitting work.
     """
-    model_name = model_name or os.environ.get("ORBIT_MODEL") or DEFAULT_MODEL
+    model_name = resolve_model_name(model_name)
     for prefix, required_key in _REQUIRED_KEY_BY_PREFIX.items():
         if model_name.startswith(prefix) and not os.environ.get(required_key):
             raise RuntimeError(

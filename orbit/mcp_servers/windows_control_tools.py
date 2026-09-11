@@ -14,9 +14,12 @@ a file path can. Two structural mitigations stand in for that:
   1. Confidence gating (Contract 3 / Section 7): windows_click and
      windows_drag refuse to act below orbit/config/windows_control_policy.yaml's
      min_actuation_confidence, which raw {x, y} coordinates never clear
-     (scored at Confidence.VISION_INFERRED) — there is no confirm channel
-     to route a low-confidence click through, so this is a hard stop, not
-     a softer retry path.
+     (scored at Confidence.VISION_INFERRED). The one way past it is a
+     single-use approval token a human minted for that exact action
+     (orbit/confirmation.py), spent in _require_confidence. An operator can
+     opt windows_click's bare {x, y} out of the gate with
+     confirm_raw_coordinate_clicks: false — see ClickTool. The shipped
+     policy keeps the gate on.
   2. A fail-closed key-combo denylist (same file) for windows_key, since a
      tier can't express "this one call is more destructive than the rest
      of this tool's calls" any more than fs_write_file's tier can.
@@ -499,18 +502,42 @@ class ScrollTool(BaseTool):
         return {"direction": direction, "amount": amount}, Confidence.API_SUCCESS
 
 
+def _is_bare_point(target: Any) -> bool:
+    return isinstance(target, dict) and set(target) == {"x", "y"}
+
+
+def _unsupervised_raw_clicks() -> bool:
+    """True only when the operator has switched raw-coordinate approval OFF.
+
+    Reads the same key orbit/confirmation.py reads, with the same default —
+    absent means ask — so the parent's "should we ask?" and this process's
+    "may we click?" cannot disagree about a policy file that predates the key.
+    """
+    policy = load_windows_control_policy()
+    return not bool(policy.get("confirm_raw_coordinate_clicks", True))
+
+
 class ClickTool(BaseTool):
     """windows_click — target is an ElementRef-shaped locator (preferred)
-    or raw {x, y} (vision-tier only). Confidence below
-    windows_control_policy.yaml's min_actuation_confidence is refused
-    outright — see _require_confidence and the module docstring."""
+    or raw {x, y} (vision-tier). Confidence below
+    windows_control_policy.yaml's min_actuation_confidence is refused unless
+    the call carries a human's single-use approval token — see
+    _require_confidence and the module docstring."""
 
     async def run(self, args: dict, token: CancellationToken) -> tuple[Any, Optional[float]]:
         target = args["target"]
-        # Raw {x, y} coordinate click — bypass confidence gate entirely.
-        # The user explicitly enabled direct coordinate clicks for vision-driven
-        # navigation: perception_capture_screenshot → see screenshot → click {x,y}.
-        if isinstance(target, dict) and set(target.keys()) <= {"x", "y"} and "x" in target:
+        # A bare {x, y} is a point the model picked by looking at a picture.
+        # By default it goes through the same gate as a vision guess: scored
+        # VISION_INFERRED by _resolve_click_target, and refused below the floor
+        # unless it carries the approval token a human minted for this click.
+        #
+        # The unguarded path below exists only when an operator opts in with
+        # confirm_raw_coordinate_clicks: false, for screenshot-driven control
+        # where a prompt per click is unusable. It is off in the shipped policy
+        # and must stay an explicit choice: while it is on, the model can click
+        # anywhere on screen with nobody's yes — the one thing root CLAUDE.md's
+        # Invariant 7 rules out.
+        if _is_bare_point(target) and _unsupervised_raw_clicks():
             cx, cy = int(target["x"]), int(target["y"])
             pywinauto_mouse.click(button="left", coords=(cx, cy))
             return {"clicked": {"x": cx, "y": cy, "source": "direct_coords"}}, Confidence.VISION_INFERRED

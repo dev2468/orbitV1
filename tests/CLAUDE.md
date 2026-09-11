@@ -1,6 +1,6 @@
 # tests/ — philosophy, fixtures, and the real-DB trap
 
-**552 tests across 26 test files** (`pytest tests/ -q` collects them all; one file,
+**556 tests across 26 test files** (`pytest tests/ -q` collects them all; one file,
 `test_windows_control_live.py`, skips itself unless opted in).
 
 Grouped by what they are for:
@@ -112,8 +112,8 @@ over real `http://` to reach `browser_navigate` at all.
   friends. Moving code between modules can void that guard without changing behaviour — if you
   relocate memory code, relocate the check.
 - `test_high_tier_tool_is_blocked_with_confirmation_required` uses a synthetic tool name on purpose:
-  nothing real is tier `high` today, so it tests the mechanism rather than depending on a specific
-  tool staying high-tier.
+  it tests the mechanism rather than depending on a specific tool (`fs_delete`, `windows_focus_window`,
+  `email_send` are the real ones today) staying high-tier.
 - Tests that construct `SafetyPlugin` directly pass explicit small `risk_tiers`/`tool_registry`
   dicts to avoid depending on the live YAML. `test_every_tool_the_agent_exposes_at_build_time_is_registered`
   is the deliberate exception — it must read the real registry to do its job.

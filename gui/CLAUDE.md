@@ -244,8 +244,10 @@ A `KeyError` on resolve is swallowed: the row was already decided by the REPL as
 dashboard, and refreshing shows the truth. That is a race, not an error — and it is what stops a
 REJECTED row from later being flipped to APPROVED.
 
-The waiting side only listens when `approval_gui_wait_seconds` is non-zero, and it defaults to **0**,
-so every unattended run (eval, CI, a scheduled task) fails closed fast instead of hanging. Turn it on
+The waiting side only listens when `approval_gui_wait_seconds` is non-zero. The code default is
+**0**, so a config without the key fails closed immediately; the shipped YAML sets **30**, so an
+unanswered request fails closed after 30 seconds. Set it back to 0 for unattended runs (eval, CI, a
+scheduled task), where a hang is worse than a refusal. Keep it on
 when a human is actually watching this window.
 
 ## Analytics arithmetic lives in `stats.py`, away from Qt

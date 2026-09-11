@@ -142,15 +142,73 @@ def test_require_confidence_allows_uia_match():
 
 
 @pytest.mark.asyncio
-async def test_click_tool_accepts_raw_coordinates_directly():
-    # Raw {x, y} now bypasses the confidence gate — the user explicitly enabled
-    # direct coordinate clicks for vision-driven navigation. The click must
-    # reach pywinauto_mouse and return ok=True.
+async def test_click_tool_refuses_raw_coordinates_without_approval():
+    """Invariant 7, as shipped. A bare {x, y} is a point the model picked by
+    looking at a picture: scored VISION_INFERRED, refused below the floor,
+    and never sent to the mouse without a human's yes for that click.
+
+    Reads the REAL policy file on purpose. Flipping
+    confirm_raw_coordinate_clicks to false in the shipped YAML must fail this
+    test — that flip lets the model click anywhere on screen unasked."""
+    from orbit.policy import load_windows_control_policy
+
+    assert load_windows_control_policy().get("confirm_raw_coordinate_clicks", True) is True
+    caller = db.create_task("caller")
+    with patch.object(wc_tools.pywinauto_mouse, "click") as mock_click:
+        result = await wc_tools.click_tool.execute({"target": {"x": 10, "y": 10}}, task_id=caller)
+    assert result.ok is False
+    assert result.error.kind == "permission_denied"
+    mock_click.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_click_tool_clicks_raw_coordinates_once_per_approval():
+    """The sanctioned way through: a human approves, a single-use token is
+    minted, and exactly one click lands. The same token cannot buy a second."""
+    caller = db.create_task("caller")
+    confirmation_id = db.create_pending_confirmation(
+        "windows_click", {"target": {"x": 10, "y": 10}}, task_id=caller
+    )
+    token = db.resolve_pending_confirmation(confirmation_id, approved=True)
+    args = {"target": {"x": 10, "y": 10}, "approval_token": token}
+
+    with patch.object(wc_tools.pywinauto_mouse, "click") as mock_click:
+        first = await wc_tools.click_tool.execute(args, task_id=caller)
+    assert first.ok is True
+    mock_click.assert_called_once_with(button="left", coords=(10, 10))
+
+    with patch.object(wc_tools.pywinauto_mouse, "click") as mock_again:
+        replay = await wc_tools.click_tool.execute(args, task_id=caller)
+    assert replay.ok is False
+    assert replay.error.kind == "permission_denied"
+    mock_again.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unsupervised_raw_clicks_are_an_opt_in_that_opens_nothing_else(monkeypatch):
+    """confirm_raw_coordinate_clicks: false is an operator opt-in for
+    screenshot-driven control: a bare {x, y} then clicks unasked. It must not
+    widen anything else — a below-floor ElementRef, which is what
+    perception_vision_locate returns, is still refused without a token."""
+    monkeypatch.setattr(
+        wc_tools, "load_windows_control_policy",
+        lambda: {"min_actuation_confidence": 0.70, "confirm_raw_coordinate_clicks": False},
+    )
     caller = db.create_task("caller")
     with patch.object(wc_tools.pywinauto_mouse, "click") as mock_click:
         result = await wc_tools.click_tool.execute({"target": {"x": 10, "y": 10}}, task_id=caller)
     assert result.ok is True
     mock_click.assert_called_once_with(button="left", coords=(10, 10))
+
+    vision_ref = {
+        "element_id": "vision:1/knob", "bounds": [0, 0, 10, 10],
+        "source": "vision", "confidence": wc_tools.Confidence.VISION_INFERRED,
+    }
+    with patch.object(wc_tools.pywinauto_mouse, "click") as mock_vision:
+        refused = await wc_tools.click_tool.execute({"target": vision_ref}, task_id=caller)
+    assert refused.ok is False
+    assert refused.error.kind == "permission_denied"
+    mock_vision.assert_not_called()
 
 
 @pytest.mark.asyncio
