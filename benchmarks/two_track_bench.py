@@ -115,7 +115,7 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[Optional[float], Optional[f
     denom = 1 + z * z / n
     centre = (p + z * z / (2 * n)) / denom
     half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return (round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4))
+    return (round(max(0.0, centre - half), 6), round(min(1.0, centre + half), 6))
 
 
 def describe(values: list[Optional[float]]) -> dict[str, Any]:
@@ -265,20 +265,20 @@ def _summarize_classify(rows: list[dict], repeats: int) -> dict[str, Any]:
         "items": len(items),
         "call_level": {
             "n": len(labelled),
-            "accuracy": round(correct / len(labelled), 4) if labelled else None,
+            "accuracy": round(correct / len(labelled), 6) if labelled else None,
             "accuracy_ci95": wilson(correct, len(labelled)),
             "confusion": {
                 "TASK": {"TASK": len(true_task) - false_chat, "CHAT": false_chat},
                 "CHAT": {"CHAT": len(true_chat) - false_task, "TASK": false_task},
             },
-            "false_chat_rate": round(false_chat / len(true_task), 4) if true_task else None,
+            "false_chat_rate": round(false_chat / len(true_task), 6) if true_task else None,
             "false_chat_ci95": wilson(false_chat, len(true_task)),
-            "false_task_rate": round(false_task / len(true_chat), 4) if true_chat else None,
+            "false_task_rate": round(false_task / len(true_chat), 6) if true_chat else None,
             "false_task_ci95": wilson(false_task, len(true_chat)),
         },
         "item_level_majority": {
             "n": len(labelled_items),
-            "accuracy": round(item_correct / len(labelled_items), 4) if labelled_items else None,
+            "accuracy": round(item_correct / len(labelled_items), 6) if labelled_items else None,
             "accuracy_ci95": wilson(item_correct, len(labelled_items)),
             "false_chat": item_false_chat, "of_task_items": len(item_task),
             "false_chat_ci95": wilson(item_false_chat, len(item_task)),
@@ -292,13 +292,13 @@ def _summarize_classify(rows: list[dict], repeats: int) -> dict[str, Any]:
             "errors": sum(r["error"] is not None for r in rows),
         },
         "per_category": {
-            c: {**v, "accuracy": round(v["correct"] / v["n"], 4)}
+            c: {**v, "accuracy": round(v["correct"] / v["n"], 6)}
             for c, v in sorted(categories.items())
         },
         "ambiguous": {
             "calls": len(ambiguous),
             "routed_task": amb_task,
-            "routed_task_share": round(amb_task / len(ambiguous), 4) if ambiguous else None,
+            "routed_task_share": round(amb_task / len(ambiguous), 6) if ambiguous else None,
         },
         "false_chat_items": sorted(
             [
