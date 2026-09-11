@@ -21,6 +21,8 @@ data/quarantine/
 benchmarks/results/
 data/screenshots/
 data/*.backup-*
+# gui/spend.py's daily TTS + STT budgets — local spend state, per machine.
+data/voice_usage.json
 MCP/venv/
 MCP/__pycache__/
 MCP/*.log

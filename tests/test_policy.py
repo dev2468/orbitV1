@@ -22,7 +22,8 @@ import logging
 import pytest
 
 from orbit import db
-from orbit.policy import SafetyPlugin, classify_failure, load_tool_registry
+from orbit.policy import classify_failure, load_tool_registry
+from orbit.safety_plugin import SafetyPlugin
 from orbit.tools.foundation import ClassifiedToolError
 
 
@@ -361,3 +362,83 @@ def test_every_tool_the_agent_exposes_at_build_time_is_registered():
         f"tool(s) exposed to the model but missing from risk_tiers.yaml: {missing} "
         "— add them with a real tier before this can ship"
     )
+
+
+# --- the policy / safety_plugin layering ------------------------------------
+#
+# These guard a startup-cost fix that is invisible when it breaks. `policy.py`
+# and `safety_plugin.py` were one module until 2026-09-08; importing it pulled
+# `google.adk` (1.96s of a 2.04s import), and six MCP servers paid that in
+# parallel on every task purely to read a YAML file. Splitting them took the
+# headless MCP connect from 9.44s to 1.29s.
+#
+# One stray `from google.adk...` at the top of policy.py silently puts all of
+# it back — nothing fails, tasks just get slow again. Hence a test.
+
+
+def test_policy_does_not_import_adk():
+    """orbit.policy must stay ADK-free. Thirteen call sites — every MCP
+    server, the GUI, confirmation.py — import it for a YAML reader and would
+    otherwise drag in the whole agent framework."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys; import orbit.policy; "
+        "bad = [m for m in sys.modules if m.startswith('google.adk')]; "
+        "print(','.join(sorted(bad)))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120,
+    )
+    assert out.returncode == 0, out.stderr
+    leaked = out.stdout.strip()
+    assert not leaked, (
+        f"orbit.policy pulled in google.adk ({leaked}). That costs ~2s per MCP "
+        "server on every task. Anything needing ADK belongs in "
+        "orbit/safety_plugin.py instead."
+    )
+
+
+def test_mcp_server_tool_modules_do_not_import_adk():
+    """The same guard one level out: a tool module is loaded in a server
+    subprocess, where there is no agent to police and so no reason for ADK."""
+    import subprocess
+    import sys
+
+    modules = [
+        "orbit.mcp_servers.memory_tools",
+        "orbit.mcp_servers.filesystem_tools",
+        "orbit.mcp_servers.communication_tools",
+        "orbit.mcp_servers.browser_policy_tools",
+    ]
+    probe = (
+        "import sys;"
+        + "".join(f"import {m};" for m in modules)
+        + "print(','.join(sorted(m for m in sys.modules "
+          "if m.startswith('google.adk'))))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=180,
+    )
+    assert out.returncode == 0, out.stderr
+    leaked = out.stdout.strip()
+    assert not leaked, (
+        f"an MCP tool module pulled in google.adk ({leaked}) — ~2s of startup "
+        "per server, six of them in parallel, on every task"
+    )
+
+
+def test_safety_plugin_still_reachable_and_wired():
+    """The split must not have moved the enforcement point out of the path."""
+    from orbit.safety_plugin import SafetyPlugin
+
+    plugin = SafetyPlugin()
+    for hook in (
+        "before_tool_callback",
+        "after_tool_callback",
+        "on_tool_error_callback",
+        "before_model_callback",
+    ):
+        assert callable(getattr(plugin, hook)), f"{hook} missing after the split"
+    assert plugin.tool_registry, "registry did not load through the split"

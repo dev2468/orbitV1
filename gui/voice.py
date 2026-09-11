@@ -14,6 +14,7 @@ import ctypes
 import ctypes.wintypes
 import os
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui import theme
+from gui.spend import stt_guard
 
 try:
     from deepgram import DeepgramClient
@@ -134,6 +136,7 @@ class VoiceController(QObject):
     transcript_interim = Signal(str)        # live partial text
     transcript_final_segment = Signal(str)  # committed segment
     transcript_ready = Signal(str)          # complete text when session ends
+    budget_exceeded = Signal(str)           # daily STT budget reached
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -143,6 +146,12 @@ class VoiceController(QObject):
         self._lock = threading.Lock()
         self._segments: list[str] = []
         self._interim: str = ""
+        # Deepgram bills Nova-3 per minute of audio and nothing else watches
+        # that total (db.get_daily_cost has had no callers since the old voice
+        # runtime was deleted). It matters more now that a transcript submits
+        # itself: the microphone opens more often than it did as a manual box.
+        self.guard = stt_guard()
+        self._stream_started_at: float = 0.0
 
     @property
     def is_active(self) -> bool:
@@ -183,6 +192,18 @@ class VoiceController(QObject):
             return
         if not api_key:
             print("[voice] DEEPGRAM_API_KEY not set in .env", flush=True)
+            return
+        # Checked before opening, never mid-stream: cutting someone off
+        # halfway through a sentence would lose what they already said, and
+        # the overshoot is bounded by one session anyway.
+        if self.guard.would_exceed(0):
+            message = (
+                f"Daily speech-to-text budget reached "
+                f"({self.guard.spent_today()}s of {self.guard.daily_cap}s). "
+                f"Raise ORBIT_STT_DAILY_SECOND_CAP in .env to continue."
+            )
+            print(f"[voice] {message}", flush=True)
+            self.budget_exceeded.emit(message)
             return
         self._api_key = api_key
         self._active = True
@@ -272,7 +293,16 @@ class VoiceController(QObject):
                     callback=audio_callback,
                 ):
                     print("[voice] mic open, streaming…", flush=True)
+                    ctrl._stream_started_at = time.monotonic()
                     stop_event.wait()  # blocks until _active flips or send_media fails
+                # Wall-clock while the mic was open is what Deepgram bills, so
+                # it is what gets recorded — counting frames would miss the
+                # connection time the meter is still running for.
+                if ctrl._stream_started_at:
+                    ctrl.guard.record(
+                        int(time.monotonic() - ctrl._stream_started_at) or 1
+                    )
+                    ctrl._stream_started_at = 0.0
 
                 # Gracefully flush then close the WebSocket.
                 try:

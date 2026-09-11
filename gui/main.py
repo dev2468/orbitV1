@@ -34,9 +34,11 @@ the single, deliberate exception (``gui/CLAUDE.md``).
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -77,17 +79,58 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QMenu,
 )
 
 from orbit import db
 from orbit.policy import load_windows_control_policy
+# orbit.models is deliberately litellm-free — see its docstring. Importing
+# orbit.agent for the same names would cost this process 8.7s at startup.
+from orbit.models import (
+    DEFAULT_MODEL as _DEFAULT_MODEL,
+    KNOWN_MODELS as _KNOWN_MODELS,
+    short_model_name as _short_model_name,
+)
 from gui import theme
 from gui.stats import format_duration
 from gui.step_tracker import StepTracker, StepStatus
 from gui.history_view import TaskHistoryView
 from gui.voice import HotkeyFilter, ScrimWidget, VoiceController, VoiceModal
+from gui.ack_controller import AckController
+from gui.speech import SpeechPlayer, split_sentences
 
 _VENV_PYTHON = str(Path(_PROJECT_ROOT) / "venv" / "Scripts" / "python.exe")
+
+# Marks a structured progress line on the worker's stdout: `[ORBIT]{json}`.
+#
+# Duplicated from orbit.run_task.EVENT_PREFIX rather than imported, and that
+# is deliberate: importing orbit.run_task would pull litellm and google-adk
+# into the GUI process, which measured 10.6s of import time this process has
+# no other reason to pay. The GUI already keeps to the light end of orbit
+# (db, policy) for the same reason. Change one, change the other.
+_EVENT_PREFIX = "[ORBIT]"
+
+# How long a submitted goal waits for the acknowledgement to classify it before
+# being sent to the worker anyway. Classification normally lands ~1s in; this is
+# the ceiling for a slow or failed provider, not the expected wait.
+_DISPATCH_GUARD_MS = 3000
+
+# The foreground lane waits the FULL window even once classified, so the spoken
+# acknowledgement lands before anything touches the real mouse and keyboard and
+# the user can still cancel with Esc. Headless does not need it: a headless
+# task's first several seconds are MCP connect, which changes nothing.
+_FOREGROUND_HOLD_MS = int(os.environ.get("ORBIT_VOICE_HOLD_MS", "") or 2500)
+
+# How long after a transcript before it submits itself. Short, because the
+# acknowledgement is the real confirmation — the user hears what was understood
+# a second later, and Esc still stops everything.
+_AUTO_SUBMIT_MS = int(os.environ.get("ORBIT_AUTO_SUBMIT_MS", "") or 900)
+
+# How many finished turns the thread keeps rendered. A QTextEdit re-lays
+# out its whole document on setHtml, so an unbounded thread makes every
+# later turn slower to render. Twenty is far more than anyone scrolls
+# back through, and the full history is in the History tab regardless.
+_MAX_THREAD_TURNS = 20
 
 # Starter prompts offered under the input when the workbench is idle. Each is
 # a full goal, not a category label — clicking one should be runnable as-is.
@@ -503,10 +546,41 @@ class OrbitWindow(QMainWindow):
         self._worker: QProcess | None = None
         self._task_running = False
         self._task_started_at: float | None = None
+        self._conversation_id: str = f"CONV-{uuid.uuid4().hex[:12]}"
         self._voice_ctrl: VoiceController | None = None
         self._committed_text = ""
         self._raw_buffer = ""
         self._goal_header = ""
+        # Set when the goal in the box arrived by voice, cleared on submit.
+        # It decides whether the acknowledgement is *spoken* — someone typing
+        # at a keyboard has the screen in front of them and did not ask to be
+        # talked at. The acknowledgement itself runs either way, because the
+        # useful part of "I'll search Amazon for that" is knowing you were
+        # understood before the work track has said anything at all.
+        self._voice_originated = False
+        # Latched from _voice_originated at submit time, so that clearing the
+        # box mid-task cannot change whether the reply already in flight for
+        # THIS task gets spoken.
+        self._spoken_submission = False
+        self._ack_text = ""
+        self._last_goal = ""
+        # A goal held back from the worker until the acknowledgement says
+        # whether it is work at all — see "deferred dispatch".
+        self._pending_work: dict | None = None
+        self._hold_for_full_window = False
+        # The last goal the classifier called purely social. Re-submitting it
+        # verbatim forces the work track, which is the recovery path for a
+        # wrong classification.
+        self._chat_only_goal = ""
+        # How the last task actually ended, from the `result` event —
+        # richer than the exit code the sentinel carries.
+        self._result_status = ""
+        self._result_text = ""
+        # Rendered HTML for each finished turn of the current conversation.
+        self._turn_html: list[str] = []
+        # True between a CHAT classification and the ack finishing, which is
+        # when a social turn actually ends. See _on_ack_classified.
+        self._chat_turn = False
         self._auto_scroll = True
         self._drawer_open = False
         self._current_confirm_id: str | None = None
@@ -534,6 +608,7 @@ class OrbitWindow(QMainWindow):
         self._build_status_bar()
         self._build_overlays()
         self._setup_voice()
+        self._setup_speech()
         self._setup_shortcuts()
 
         self.refresh_timer = QTimer(self)
@@ -580,6 +655,57 @@ class OrbitWindow(QMainWindow):
 
         lay.addStretch()
 
+        # Recent chats sits next to New Chat because resuming and starting are
+        # the same decision, made in the same moment. Putting it in the
+        # History tab would mean leaving the place you type to get back to the
+        # place you type.
+        self.chats_btn = QPushButton("Recent  ▾")
+        self.chats_btn.setObjectName("chatsBtn")
+        self.chats_btn.setCursor(Qt.PointingHandCursor)
+        self.chats_btn.setFixedHeight(32)
+        self.chats_btn.setToolTip("Reopen an earlier chat and carry on in it")
+        self.chats_btn.setStyleSheet(
+            f"#chatsBtn {{ background:transparent; color:{theme.TEXT_SECONDARY};"
+            f" border:1px solid {theme.BORDER}; border-radius:{theme.RADIUS_SM}px;"
+            f" padding:0 12px; font-size:12px; font-weight:500; }}"
+            f"#chatsBtn:hover {{ border-color:{theme.ACCENT};"
+            f" color:{theme.ACCENT}; }}"
+            f"#chatsBtn::menu-indicator {{ image:none; width:0px; }}"
+            f"#chatsBtn QMenu {{ background:{theme.SURFACE};"
+            f" border:1px solid {theme.BORDER}; border-radius:8px; padding:4px; }}"
+        )
+        chats_menu = QMenu(self.chats_btn)
+        chats_menu.setStyleSheet(
+            f"QMenu {{ background:{theme.SURFACE}; border:1px solid {theme.BORDER};"
+            f" border-radius:8px; padding:4px; font-size:12px; }}"
+            f"QMenu::item {{ padding:6px 14px; border-radius:6px;"
+            f" color:{theme.TEXT_SECONDARY}; }}"
+            f"QMenu::item:selected {{ background:{theme.ACCENT_LIGHT};"
+            f" color:{theme.ACCENT}; }}"
+            f"QMenu::item:disabled {{ color:{theme.TEXT_TERTIARY}; }}"
+        )
+        self.chats_btn.setMenu(chats_menu)
+        # Rebuilt on open, not on a timer: the list is short, reading it costs
+        # one query, and a stale menu is the one thing that makes a picker
+        # feel broken.
+        chats_menu.aboutToShow.connect(self._refresh_chat_picker)
+        lay.addWidget(self.chats_btn)
+        lay.addSpacing(8)
+
+        self.new_chat_btn = QPushButton("+ New Chat")
+        self.new_chat_btn.setObjectName("newChatBtn")
+        self.new_chat_btn.setCursor(Qt.PointingHandCursor)
+        self.new_chat_btn.setFixedHeight(32)
+        self.new_chat_btn.setStyleSheet(
+            f"#newChatBtn {{ background:transparent; color:{theme.ACCENT};"
+            f" border:1px solid {theme.ACCENT}; border-radius:{theme.RADIUS_SM}px;"
+            f" padding:0 14px; font-size:12px; font-weight:600; }}"
+            f"#newChatBtn:hover {{ background:{theme.ACCENT}; color:#FFFFFF; }}"
+        )
+        self.new_chat_btn.clicked.connect(self._new_conversation)
+        lay.addWidget(self.new_chat_btn)
+        lay.addSpacing(12)
+
         self.bell_btn = BellButton()
         self.bell_btn.clicked.connect(self._toggle_drawer)
         lay.addWidget(self.bell_btn)
@@ -610,6 +736,38 @@ class OrbitWindow(QMainWindow):
             chips_lay.addWidget(self._make_chip(label, goal))
         chips_lay.addStretch()
         col.addWidget(self.chips_row)
+
+        # Shown only after the acknowledgement classified a turn as purely
+        # social and skipped the work track. It is the recovery path for a
+        # wrong classification, and it is a real button rather than the line
+        # of grey text it started as — an affordance nobody notices is not a
+        # recovery path, and this one has to be found in the two seconds
+        # before the user concludes the app ignored them.
+        self.rerun_row = QWidget()
+        self.rerun_row.setStyleSheet("background: transparent;")
+        rerun_lay = QHBoxLayout(self.rerun_row)
+        rerun_lay.setContentsMargins(0, 0, 0, 0)
+        rerun_lay.setSpacing(8)
+        self.rerun_hint = QLabel("Answered directly, without running a task.")
+        self.rerun_hint.setStyleSheet(
+            f"font-size:12px;color:{theme.TEXT_TERTIARY};background:transparent;"
+        )
+        rerun_lay.addWidget(self.rerun_hint)
+        self.rerun_btn = QPushButton("Run it as a task  →")
+        self.rerun_btn.setObjectName("rerunBtn")
+        self.rerun_btn.setCursor(Qt.PointingHandCursor)
+        self.rerun_btn.setStyleSheet(
+            f"#rerunBtn {{ background:{theme.ACCENT_LIGHT};"
+            f" border:1px solid {theme.ACCENT_BORDER}; border-radius:10px;"
+            f" padding:4px 12px; font-size:12px; font-weight:600;"
+            f" color:{theme.ACCENT_PRESSED}; }}"
+            f"#rerunBtn:hover {{ background:{theme.ACCENT_BORDER}; }}"
+        )
+        self.rerun_btn.clicked.connect(self._force_task_rerun)
+        rerun_lay.addWidget(self.rerun_btn)
+        rerun_lay.addStretch()
+        self.rerun_row.hide()
+        col.addWidget(self.rerun_row)
 
         self.progress = QProgressBar()
         self.progress.setObjectName("progressBar")
@@ -767,6 +925,56 @@ class OrbitWindow(QMainWindow):
         )
         self.effort_combo.currentTextChanged.connect(lambda _: self._update_status_context())
         opt.addWidget(self.effort_combo)
+
+        # --- model selector --------------------------------------------------
+        # North star #3 is "the user picks the brain", and until now that meant
+        # editing .env and restarting. Every layer below already took the
+        # parameter — `build_agent(model_name=…)` → `select_model(model_name=…)`
+        # — so this is the missing surface, not a new capability.
+        #
+        # Populated from KNOWN_MODELS, which is also the list of models
+        # verified to support tool calling. A model that cannot call tools
+        # cannot drive this agent at all, so an arbitrary free-text box would
+        # be a way to break the app rather than a way to choose.
+        divider2 = QLabel()
+        divider2.setFixedSize(1, 16)
+        divider2.setStyleSheet(f"background:{theme.BORDER};")
+        opt.addWidget(divider2)
+
+        model_label = QLabel("Model")
+        model_label.setStyleSheet(
+            f"font-size:12px;color:{theme.TEXT_TERTIARY};background:transparent;"
+        )
+        opt.addWidget(model_label)
+
+        self.model_combo = QComboBox()
+        self.model_combo.setObjectName("modelCombo")
+        for full_name, note in _KNOWN_MODELS.items():
+            self.model_combo.addItem(_short_model_name(full_name), full_name)
+            self.model_combo.setItemData(
+                self.model_combo.count() - 1, note, Qt.ToolTipRole
+            )
+        default_idx = self.model_combo.findData(_DEFAULT_MODEL)
+        self.model_combo.setCurrentIndex(max(0, default_idx))
+        self.model_combo.setCursor(Qt.PointingHandCursor)
+        self.model_combo.setToolTip(
+            "Which model runs the task. Hover an entry for its trade-offs.\n"
+            "The fast reply and the vision tier have their own models "
+            "(ORBIT_ACK_MODEL, _VISION_MODEL) and are not changed here."
+        )
+        self.model_combo.setStyleSheet(
+            f"#modelCombo {{ background:{theme.INPUT_BG}; border:none;"
+            f" border-radius:10px; padding:4px 10px 4px 14px;"
+            f" font-size:12px; font-weight:500; color:{theme.TEXT_SECONDARY};"
+            f" min-width:120px; }}"
+            f"#modelCombo::drop-down {{ border:none; width:18px; }}"
+            f"#modelCombo QAbstractItemView {{ background:{theme.SURFACE};"
+            f" border:1px solid {theme.BORDER}; border-radius:8px; padding:4px;"
+            f" selection-background-color:{theme.ACCENT_LIGHT};"
+            f" selection-color:{theme.ACCENT}; outline:none; }}"
+        )
+        self.model_combo.currentTextChanged.connect(lambda _: self._update_status_context())
+        opt.addWidget(self.model_combo)
 
         opt.addStretch()
 
@@ -1114,8 +1322,27 @@ class OrbitWindow(QMainWindow):
         esc.activated.connect(self._on_escape)
 
     def _on_escape(self) -> None:
+        """Esc is the universal "no, stop".
+
+        Ordered most-recent-intent first. The two additions are the ones that
+        make auto-submitted voice safe to live with: a transcript that has not
+        gone out yet is cancellable, and speech that is playing is silenceable
+        without touching the running task.
+        """
         if self.voice_modal.isVisible():
             self._cancel_voice()
+        elif self._auto_submit_timer.isActive():
+            self._cancel_auto_submit()
+        elif self._pending_work is not None:
+            # A goal held for the foreground window, not yet sent to the
+            # worker. Nothing has touched the mouse; cancelling is free.
+            self._cancel_pending_work()
+            self._ack.cancel()
+            self._speech.stop()
+            self._append_plain("\n[not sent]\n", theme.DANGER_TEXT)
+            self._task_done(0)
+        elif self._speech.is_speaking:
+            self._speech.stop()
         elif self._drawer_open:
             self._close_drawer()
 
@@ -1135,6 +1362,131 @@ class OrbitWindow(QMainWindow):
             self.voice_modal.center_on(self._central)
 
     # ===================== navigation =====================
+
+    def _resume_conversation(self, conversation_id: str) -> None:
+        """Reopen a past chat and carry on in it.
+
+        The worker needs nothing for this: sending a goal with an existing
+        conversation_id already replays that conversation's stored turns into
+        the prompt (`run_task._build_conversation_context`), which is what
+        made resuming work before any of this UI existed. All that is missing
+        is putting the thread back on screen and pointing new goals at it.
+
+        **A resumed chat is lower fidelity than one you never left.** A live
+        conversation continues the real ADK session — the actual tool calls,
+        their arguments and their results. A resumed one gets a summary, with
+        results clipped. "Do that again" works; "why did that fail" will not
+        have the error text.
+        """
+        if self._task_running:
+            return
+        turns = db.conversation_turns(conversation_id)
+        if not turns:
+            return
+
+        self._close_active_conversation()
+        self._conversation_id = conversation_id
+        self._turn_html = [
+            html for html in (self._turn_html_from_row(t) for t in turns) if html
+        ][-_MAX_THREAD_TURNS:]
+
+        self.rerun_row.hide()
+        self.output_stack.setCurrentIndex(1)
+        self._append_thread_so_far()
+        self.step_tracker.reset()
+        self._show_workbench()
+        self.goal_input.setFocus()
+        self._set_status("idle")
+
+    def _turn_html_from_row(self, turn: dict) -> str:
+        """Render one stored task row as a thread turn.
+
+        Goes through the same `_turn_html_for` the live path uses, so a
+        resumed chat is indistinguishable from one still running. Returns ""
+        for a turn with nothing to show — an interrupted or crashed task
+        leaves a row with an empty result, and a blank card in the thread
+        looks like a rendering bug rather than an abandoned turn.
+        """
+        goal = (turn.get("goal") or "").strip()
+        result = (turn.get("result") or "").strip()
+        if not goal:
+            return ""
+
+        status = (turn.get("status") or "").upper()
+        label, tone = self._OUTCOMES.get(status, ("Task finished", "neutral"))
+        if tone == "success":
+            bg, border, fg = theme.SUCCESS_BG, theme.SUCCESS_BORDER, theme.SUCCESS_TEXT
+        elif tone == "danger":
+            bg, border, fg = theme.DANGER_BG, theme.DANGER_BORDER, theme.DANGER_TEXT
+        else:
+            bg, border, fg = theme.INPUT_BG, theme.BORDER, theme.TEXT_SECONDARY
+
+        status_html = (
+            f'<div style="background:{bg};border:1px solid {border};'
+            f'border-radius:10px;padding:8px 14px;margin-top:14px;">'
+            f'<span style="color:{fg};font-size:12px;font-weight:600;">'
+            f'● {label}</span></div>'
+        )
+        body_html = _md_to_html(result) if result else (
+            f'<p style="color:{theme.TEXT_TERTIARY};font-size:12px;'
+            f'font-style:italic;margin:0;">No result was recorded for this turn.</p>'
+        )
+        return self._turn_html_for(
+            goal_line=f"> {goal}",
+            subtitle=f"{turn.get('lane', 'headless')} lane · earlier",
+            # No acknowledgement is stored — it was streamed, never persisted.
+            ack="",
+            body_html=body_html,
+            status_html=status_html,
+        )
+
+    def _close_active_conversation(self) -> None:
+        """Release the current conversation's runner in the worker."""
+        if self._worker is None or self._worker.state() == QProcess.NotRunning:
+            return
+        try:
+            payload = json.dumps({"close_conversation": self._conversation_id})
+            self._worker.write((payload + chr(10)).encode())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_chat_picker(self) -> None:
+        """Repopulate the recent-chats menu from the conversations table."""
+        menu = self.chats_btn.menu()
+        menu.clear()
+        try:
+            conversations = db.list_conversations(limit=12)
+        except Exception:  # noqa: BLE001
+            conversations = []
+
+        usable = 0
+        for conv in conversations:
+            conv_id = conv.get("conversation_id", "")
+            if conv_id == self._conversation_id:
+                continue  # already open
+            title = (conv.get("title") or "").strip() or conv_id
+            if len(title) > 52:
+                title = title[:52] + "…"
+            action = menu.addAction(title)
+            action.triggered.connect(
+                lambda _checked=False, cid=conv_id: self._resume_conversation(cid)
+            )
+            usable += 1
+        if not usable:
+            menu.addAction("No earlier chats").setEnabled(False)
+
+    def _new_conversation(self) -> None:
+        if self._task_running:
+            return
+# Release the old conversation's runner and its six MCP subprocesses —
+        # otherwise starting a new chat leaks a browser nothing comes back to.
+        self._close_active_conversation()
+        self._conversation_id = f"CONV-{uuid.uuid4().hex[:12]}"
+        self._turn_html.clear()
+        self.output_text.clear()
+        self.step_tracker.reset()
+        self.goal_input.clear()
+        self.goal_input.setFocus()
 
     def _on_nav_change(self, value: str) -> None:
         if value == "workbench":
@@ -1160,6 +1512,190 @@ class OrbitWindow(QMainWindow):
         self.goal_input.setText(goal)
         self.goal_input.setFocus()
 
+    # ===================== the acknowledgement track =====================
+
+    def _setup_speech(self) -> None:
+        """Wire the fast reply and its voice.
+
+        This is the second of the two tracks a goal starts. The work track
+        (the warm worker) takes seconds before it says anything — MCP toolsets
+        connect in ~3.3s and the first model turn carries an ~8,000-token
+        prompt — which is fine for doing a job and far too slow to sound like
+        an assistant answering. The acknowledgement track answers a smaller
+        question ("what did I just hear") with a small model and no tools, in
+        about a second, and speaks it while the work track is still starting.
+
+        Both are prewarmed here rather than lazily, because the two costs they
+        would otherwise pay on first use — TLS setup and opening the audio
+        device — measured about 0.9s each, and the first spoken request of a
+        session is the worst possible time to pay either.
+        """
+        self._ack = AckController(self)
+        self._ack.delta.connect(self._on_ack_delta)
+        self._ack.completed.connect(self._on_ack_completed)
+        self._ack.classified.connect(self._on_ack_classified)
+        self._ack.summary_completed.connect(self._on_summary_ready)
+        self._ack.failed.connect(self._on_ack_failed)
+
+        self._speech = SpeechPlayer(self)
+        self._speech.failed.connect(self._on_speech_failed)
+
+        # Safety net for the deferred dispatch below. If the acknowledgement
+        # never classifies — the network is down, the provider is slow — the
+        # work track must still run. Failing to dispatch is the one outcome
+        # this whole arrangement must never produce.
+        self._dispatch_guard = QTimer(self)
+        self._dispatch_guard.setSingleShot(True)
+        self._dispatch_guard.timeout.connect(self._dispatch_pending_work)
+
+        self._ack.prewarm()
+        self._speech.prewarm()
+
+    # -- deferred dispatch of the work track ---------------------------------
+    #
+    # The work track is NOT sent the moment a goal is submitted. It waits for
+    # the acknowledgement's [CHAT]/[TASK] classification, which lands about a
+    # second in, on the stream's first tokens.
+    #
+    # That second is bought deliberately. A purely social turn — "hi",
+    # "thanks", "what can you do" — does not need six MCP servers spawned and
+    # an 8,000-token prompt sent to answer it, and skipping the work track
+    # takes those from ~9s to ~1.3s. Real tasks pay one second on top of a
+    # ~9s job, during which the user is not waiting in silence: the
+    # acknowledgement is already streaming and about to be spoken.
+    #
+    # Every failure path dispatches. Classification failure, provider error,
+    # and the guard timer all end in `_dispatch_pending_work`, because a task
+    # that silently never ran is far worse than a wasted worker turn.
+
+    def _defer_work(
+        self, payload: dict, *, hold_ms: int, hold_full: bool = False
+    ) -> None:
+        """Queue a goal for the worker, to be sent when the hold ends.
+
+        `hold_full` says what the timer MEANS, and it is passed explicitly
+        rather than inferred from `hold_ms` — the two durations do not order
+        the way the intent does. The headless guard (3s) is deliberately
+        *longer* than the foreground hold (2.5s), because one is a
+        rarely-reached ceiling for a dead provider and the other is a window
+        that always elapses. Deriving intent from duration got this backwards.
+
+        hold_full=False: the timer is a fallback. Classification dispatches
+            as soon as it arrives, usually ~1s in.
+        hold_full=True: the timer is the dispatcher. Classification does not
+            short-circuit it, so the spoken acknowledgement lands and can be
+            countermanded before anything touches the real mouse.
+        """
+        self._pending_work = payload
+        self._hold_for_full_window = hold_full
+        self._dispatch_guard.start(hold_ms)
+
+    def _dispatch_pending_work(self) -> None:
+        """Send the queued goal to the worker. Idempotent."""
+        self._dispatch_guard.stop()
+        payload = self._pending_work
+        if payload is None:
+            return
+        self._pending_work = None
+        self._ensure_worker()
+        self._worker.write((json.dumps(payload) + "\n").encode())  # type: ignore[union-attr]
+
+    def _cancel_pending_work(self) -> None:
+        """Drop a queued goal without sending it (a chat turn, or a Stop)."""
+        self._dispatch_guard.stop()
+        self._pending_work = None
+
+    def _on_ack_classified(self, chat_only: bool) -> None:
+        # Logged for every turn, because a wrong classification is otherwise
+        # undetectable after the fact: a bad [CHAT] leaves no task row, no
+        # event row, and no trace anywhere that a goal was ever submitted.
+        print(
+            f"[classify] chat_only={chat_only} goal={self._last_goal[:80]!r}",
+            flush=True,
+        )
+        if self._pending_work is None:
+            return  # already dispatched, or nothing queued
+        if not chat_only:
+            if not self._hold_for_full_window:
+                self._dispatch_pending_work()
+            # else: the foreground window is still open; the guard timer sends it
+            return
+
+        # Purely social: the acknowledgement IS the answer, so there is no
+        # work track for this turn.
+        #
+        # The task is NOT finished here, even though nothing more will run.
+        # `classified` fires on the stream's first tokens, with the reply still
+        # arriving — and `_task_done` re-renders the output pane wholesale.
+        # Finishing now would render a half-written sentence and then append
+        # the rest underneath it. `_on_ack_completed` closes the turn instead.
+        goal = self._pending_work.get("goal", "")
+        self._cancel_pending_work()
+        self._chat_turn = True
+        self._chat_only_goal = goal
+
+    def _on_ack_delta(self, text: str) -> None:
+        if not self._ack_text:
+            self._append_plain("\n", theme.TEXT_PRIMARY)
+        self._ack_text += text
+        self._append_plain(text, theme.ACCENT_PRESSED)
+
+    def _on_ack_completed(self, text: str) -> None:
+        self._append_plain("\n\n", theme.TEXT_PRIMARY)
+        self._ack_text = text
+        if self._spoken_submission and text:
+            self._speech.enqueue(text)
+
+        if self._chat_turn:
+            # A social turn ends here: no work track ran, and this is the last
+            # thing that will be written. The goal is put back in the box so
+            # pressing Enter on it re-submits and forces the work track — the
+            # whole recovery path for a wrong classification, and it needs no
+            # new widget.
+            self._chat_turn = False
+            self.goal_input.setText(self._chat_only_goal)
+            self.rerun_row.show()
+            self._task_done(0)
+
+    def _on_summary_ready(self, text: str) -> None:
+        """Speak the finished task's result, in sentence-sized pieces.
+
+        Split so playback starts on the first sentence rather than waiting for
+        the whole thing to synthesise — the reason SpeechPlayer is a queue.
+        """
+        if not text or not self._spoken_submission:
+            return
+        for sentence in split_sentences(text):
+            self._speech.enqueue(sentence)
+
+    def _force_task_rerun(self) -> None:
+        """Run the goal the classifier called social, as a task, now.
+
+        Re-submitting the same text is already what `_submit_task` treats as
+        an override — it skips the classification wait entirely — so this only
+        has to put the text back and press send.
+        """
+        self.rerun_row.hide()
+        if not self._chat_only_goal or self._task_running:
+            return
+        self.goal_input.setText(self._chat_only_goal)
+        self._submit_task()
+
+    def _on_ack_failed(self, message: str) -> None:
+        # Deliberately quiet in the output pane. The acknowledgement is a
+        # courtesy running alongside the real task; a failed one must not look
+        # like a failed task, and the work track is entirely unaffected.
+        print(f"[ack] {message}", flush=True)
+
+    def _on_speech_failed(self, message: str) -> None:
+        # The budget guard reports through here too, and that one the user
+        # does need to see — silence would otherwise be indistinguishable from
+        # a broken microphone setup.
+        if "budget" in message.lower():
+            self._append_plain(f"\n[speech] {message}\n", theme.DANGER_TEXT)
+        else:
+            print(f"[speech] {message}", flush=True)
+
     # ===================== voice =====================
 
     def _setup_voice(self) -> None:
@@ -1170,14 +1706,40 @@ class OrbitWindow(QMainWindow):
         self._voice_ctrl.transcript_interim.connect(self._on_transcript_interim)
         self._voice_ctrl.transcript_final_segment.connect(self._on_transcript_final)
         self._voice_ctrl.transcript_ready.connect(self._on_transcript_ready)
+        self._voice_ctrl.budget_exceeded.connect(self._on_voice_budget_exceeded)
+
+        self._auto_submit_timer = QTimer(self)
+        self._auto_submit_timer.setSingleShot(True)
+        self._auto_submit_timer.timeout.connect(self._auto_submit)
 
         self._hotkey_filter = HotkeyFilter()
         self._hotkey_filter.toggled.connect(self._toggle_voice)
         QApplication.instance().installNativeEventFilter(self._hotkey_filter)
 
     def _toggle_voice(self) -> None:
-        if self._voice_ctrl:
-            self._voice_ctrl.toggle()
+        """F9 / mic button. Starting to listen always stops Orbit talking.
+
+        Barge-in: without it, pressing the hotkey while a reply is playing
+        queues you behind it, and the assistant reads out an answer you have
+        already moved on from. Interrupting is how people actually talk, and
+        it is also the fastest way to shut it up.
+        """
+        if not self._voice_ctrl:
+            return
+        if not self._voice_ctrl.is_active:
+            self._speech.stop()
+            self._cancel_auto_submit()
+        self._voice_ctrl.toggle()
+
+    def _on_voice_budget_exceeded(self, message: str) -> None:
+        """The mic refused to open because the day's STT budget is spent.
+
+        Surfaced loudly rather than logged: pressing F9 and getting silence
+        is indistinguishable from a broken microphone, and the user would
+        reasonably go looking for a hardware problem that is not there."""
+        self.output_stack.setCurrentIndex(1)
+        self._append_plain(f"\n[voice] {message}\n", theme.DANGER_TEXT)
+        self._set_status("error")
 
     def _cancel_voice(self) -> None:
         if self._voice_ctrl:
@@ -1216,9 +1778,40 @@ class OrbitWindow(QMainWindow):
         self.voice_modal.set_transcript(self._committed_text)
 
     def _on_transcript_ready(self, text: str) -> None:
-        if text:
-            self.goal_input.setText(text)
-            self.goal_input.setFocus()
+        """A finished transcript submits itself.
+
+        This is what makes voice the primary input rather than a fancy way to
+        fill a text box. Requiring Enter after speaking meant every spoken goal
+        ended at the keyboard, which is the thing voice exists to avoid.
+
+        The delay before submitting is short on purpose. It is not the safety
+        mechanism — the spoken acknowledgement is, arriving about a second
+        later and saying out loud what was understood, with Esc live the whole
+        time. A window long enough to *read* a transcript would push first
+        audio from ~2s to ~4.5s and undo the entire point.
+        """
+        if not text:
+            return
+        self.goal_input.setText(text)
+        self.goal_input.setFocus()
+        # Marks the goal now in the box as spoken, so the acknowledgement for
+        # it is spoken back rather than only shown. Cleared on submit.
+        self._voice_originated = True
+
+        if self._task_running:
+            return  # a task is already running; leave the text for the user
+        self._append_plain(f"\n[heard: {text}]\n", theme.TEXT_TERTIARY)
+        self._auto_submit_timer.start(_AUTO_SUBMIT_MS)
+
+    def _cancel_auto_submit(self) -> None:
+        if self._auto_submit_timer.isActive():
+            self._auto_submit_timer.stop()
+            self._append_plain("[cancelled]\n", theme.DANGER_TEXT)
+
+    def _auto_submit(self) -> None:
+        if self._task_running or not self.goal_input.text().strip():
+            return
+        self._submit_task()
 
     # ===================== task submission =====================
 
@@ -1248,18 +1841,68 @@ class OrbitWindow(QMainWindow):
         lane = self.lane_toggle.value()
         effort = self.effort_combo.currentText().lower()
 
-        self._ensure_worker()
-        req = json.dumps({"goal": goal, "lane": lane, "effort": effort})
-        self._worker.write((req + "\n").encode())  # type: ignore[union-attr]
+        # Re-submitting the exact goal the classifier just called social is
+        # how the user overrides it. One repeat forces the work track and skips
+        # the classification wait entirely.
+        forced = goal == self._chat_only_goal
+        self._chat_only_goal = ""
+
+        # --- track one: the acknowledgement ---------------------------------
+        # Started FIRST, before the worker is written to. This one wins by
+        # several seconds: it speaks in ~1.3s while the worker is still
+        # connecting MCP servers. Anything that makes this line wait on the
+        # work track defeats the entire arrangement.
+        self._spoken_submission = self._voice_originated
+        self._voice_originated = False
+        self._ack_text = ""
+        self._chat_turn = False
+        self._result_status = ""
+        self._result_text = ""
+        self._last_goal = goal
+        self.rerun_row.hide()
+        self._speech.stop()  # a new goal supersedes whatever is still playing
+        self._ack.start(goal, self._conversation_id)
+
+        # --- track two: the actual work -------------------------------------
+        payload = {
+            "goal": goal,
+            "lane": lane,
+            "effort": effort,
+            "model": self.model_combo.currentData(),
+            "conversation_id": self._conversation_id,
+        }
+        if forced:
+            self._pending_work = payload
+            self._dispatch_pending_work()
+        else:
+            # Held until the acknowledgement classifies the turn — see
+            # "deferred dispatch" above. The hold is longer in the foreground
+            # lane: that is the one where a misheard goal moves the real mouse
+            # and keyboard, so the spoken acknowledgement gets time to land
+            # and be countermanded with Esc before anything touches the OS.
+            # Headless work is inert for its first several seconds (MCP
+            # connect), so it does not need the same margin.
+            foreground = lane == "foreground"
+            self._defer_work(
+                payload,
+                hold_ms=_FOREGROUND_HOLD_MS if foreground else _DISPATCH_GUARD_MS,
+                hold_full=foreground,
+            )
 
         self._task_running = True
         self._task_started_at = time.time()
         self._raw_buffer = ""
         self._goal_header = f"> {goal}\n  ({lane} | effort: {effort})\n"
 
-        self.output_text.clear()
+        # Deliberately NOT output_text.clear(): the finished turns above stay
+        # on screen while this one streams in underneath them. The live text
+        # is transient anyway — _render_final_output replaces the pane with
+        # the full thread when the turn ends.
+        self._append_thread_so_far()
         self.output_stack.setCurrentIndex(1)
-        self.step_tracker.reset()
+        # begin_task resets internally and opens a running step, so the rail
+        # is alive from submission rather than from the first tool call.
+        self.step_tracker.begin_task()
 
         self.lane_badge.setText(lane.upper())
         self.run_indicator.setText("● Running")
@@ -1278,11 +1921,107 @@ class OrbitWindow(QMainWindow):
         self.progress.show()
         self._set_status("running")
 
+    def _append_thread_so_far(self) -> None:
+        """Re-render finished turns, then leave the cursor at the end so the
+        new turn's streamed output appends beneath them."""
+        self.output_text.clear()
+        if not self._turn_html:
+            return
+        separator = (
+            f'<div style="border-top:1px solid {theme.BORDER};'
+            f'margin:22px 0 18px 0;"></div>'
+        )
+        self.output_text.setHtml(
+            f'<div style="font-family:{theme.FONT_FAMILY};padding:4px;">'
+            f'{separator.join(self._turn_html)}{separator}</div>'
+        )
+        cursor = self.output_text.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.output_text.setTextCursor(cursor)
+
     def _stop_task(self) -> None:
+        # Stop means both tracks. Leaving the acknowledgement to finish
+        # speaking after the user pressed Stop would be the clearest possible
+        # way to look like the button did nothing.
+        self._ack.cancel()
+        self._speech.stop()
+        self._cancel_auto_submit()
+        # A goal still held for classification has not reached the worker, so
+        # killing the process below would not stop it — it would arrive after.
+        self._cancel_pending_work()
+        if self._task_running:
+            # So the status card reads "cancelled" rather than "failed". The
+            # user asking a task to stop is not the task going wrong, and
+            # colouring it red says otherwise.
+            self._result_status = "CANCELLED"
         if self._worker and self._task_running:
-            self._append_plain("\n[task stopped by user]\n", theme.DANGER_TEXT)
+            self._append_plain("\n[task stopped by user]\n", theme.TEXT_SECONDARY)
             # _worker_exited fires via finished and calls _task_done exactly once.
             self._worker.kill()
+
+    def _handle_orbit_event(self, payload: str) -> None:
+        """Act on one `[ORBIT]{json}` progress event from the worker.
+
+        These arrive live, as ADK yields them — the whole point of the change
+        that introduced them. Before it, the worker used ``run_debug``, which
+        buffers every event and returns them only once the task is over, so
+        the step rail could not fill in until there was nothing left to watch.
+
+        Never raises: a malformed or unknown event is telemetry, and dropping
+        it silently is correct. The task's real output still arrives as prose
+        on the same stream, and `[TASK:DONE]` still ends the task, so nothing
+        here is load-bearing for correctness.
+        """
+        try:
+            event = json.loads(payload)
+        except (ValueError, TypeError):
+            return
+        kind = event.get("kind")
+
+        if kind == "tool_call":
+            self.step_tracker.handle_tool_call(str(event.get("tool", "")))
+        elif kind == "tool_result":
+            self.step_tracker.complete_current()
+        elif kind == "text_delta":
+            # A delta, not a running total — appended as it arrives so the
+            # answer types itself out. Deliberately NOT added to _raw_buffer:
+            # _render_final_output re-renders from that buffer at the end,
+            # using the canonical prose the worker prints, and counting the
+            # deltas too would duplicate the whole answer.
+            self._append_plain(str(event.get("text", "")), theme.TEXT_PRIMARY)
+        elif kind == "result":
+            # The worker emits this before tearing down its six MCP server
+            # subprocesses, which measured ~2s. Unlocking here rather than on
+            # [TASK:DONE] hands those seconds back to the user, who would
+            # otherwise be looking at a finished answer with a dead input box.
+            self._on_result_ready(
+                str(event.get("status", "")), str(event.get("text", ""))
+            )
+
+    def _on_result_ready(self, status: str, text: str = "") -> None:
+        """Re-enable input as soon as the answer exists, before teardown."""
+        if not self._task_running:
+            return
+        # Kept for the status card, which renders later on [TASK:DONE]. The
+        # exit code alone cannot distinguish a provider outage from a cancel
+        # from a crash; this can.
+        self._result_status = status
+        self._result_text = text
+        # Started here rather than on [TASK:DONE] so the summary generates
+        # during the worker's ~2s teardown instead of after it.
+        if text and self._spoken_submission:
+            self._ack.summarize(text, goal=self._last_goal)
+        self.goal_input.setEnabled(True)
+        self.chips_row.show()
+        self.send_btn.show()
+        self.stop_btn.hide()
+        ok = status == "COMPLETED"
+        self.run_indicator.setText("● Completed" if ok else f"● {status.title()}")
+        self.run_indicator.setStyleSheet(
+            f"font-size:11px;font-weight:500;"
+            f"color:{theme.SUCCESS if ok else theme.DANGER};background:transparent;"
+        )
+        self.goal_input.setFocus()
 
     def _read_stdout(self) -> None:
         if not self._worker:
@@ -1297,6 +2036,13 @@ class OrbitWindow(QMainWindow):
                 # Sentinel — never goes into _raw_buffer, which is what the
                 # final render re-parses.
                 self._task_done(int(done_m.group(1)))
+                continue
+
+            if stripped.startswith(_EVENT_PREFIX):
+                # Structured progress. Kept out of _raw_buffer for the same
+                # reason as the sentinel: the final render re-parses that
+                # buffer and would print raw JSON into the output pane.
+                self._handle_orbit_event(stripped[len(_EVENT_PREFIX):])
                 continue
 
             self._raw_buffer += line
@@ -1344,6 +2090,57 @@ class OrbitWindow(QMainWindow):
         if self._auto_scroll:
             self.output_text.ensureCursorVisible()
 
+    # Everything the runtime can tell us about how a task ended, and what the
+    # user should be told. `[TASK:DONE <exit_code>]` only distinguishes zero
+    # from non-zero — the `result` event carries the real status and message,
+    # and this is where the two are reconciled.
+    #
+    # The distinction matters because the three failure modes want different
+    # things from the user: a provider outage means try again in a minute, a
+    # cancel means nothing went wrong, and a crash means read the message.
+    # Rendering all three as "Task failed (exit 1)" told them none of that.
+    _OUTCOMES = {
+        "COMPLETED": ("Task completed successfully", "success"),
+        "CANCELLED": ("Task cancelled", "neutral"),
+        "FAILED":    ("Task failed", "danger"),
+    }
+
+    def _status_card_html(self, exit_code: int) -> str:
+        """The coloured card at the foot of a finished task."""
+        status = self._result_status or ("COMPLETED" if exit_code == 0 else "FAILED")
+        label, tone = self._OUTCOMES.get(status, ("Task failed", "danger"))
+
+        if tone == "success":
+            bg, border, fg = theme.SUCCESS_BG, theme.SUCCESS_BORDER, theme.SUCCESS_TEXT
+        elif tone == "neutral":
+            bg, border, fg = theme.INPUT_BG, theme.BORDER, theme.TEXT_SECONDARY
+        else:
+            bg, border, fg = theme.DANGER_BG, theme.DANGER_BORDER, theme.DANGER_TEXT
+
+        detail = ""
+        if tone == "danger":
+            # The worker's own words, not an exit code. run_task classifies by
+            # failure class — a provider outage says so, a tool bug names its
+            # exception type — and that text is the only thing that tells the
+            # user which of those happened.
+            reason = (self._result_text or "").strip()
+            if not reason:
+                reason = (
+                    f"The worker exited with code {exit_code} without reporting a "
+                    "reason. Check the terminal it was started from."
+                )
+            detail = (
+                f'<p style="color:{fg};font-size:12px;font-weight:400;'
+                f'margin:6px 0 0 0;">{_inline_md(reason[:600])}</p>'
+            )
+
+        return (
+            f'<div style="background:{bg};border:1px solid {border};'
+            f'border-radius:10px;padding:10px 14px;margin-top:14px;">'
+            f'<span style="color:{fg};font-size:12px;font-weight:600;">● {label}</span>'
+            f'{detail}</div>'
+        )
+
     def _task_done(self, exit_code: int) -> None:
         """Restore the UI after a task ends (normal finish or kill)."""
         if not self._task_running:
@@ -1381,16 +2178,47 @@ class OrbitWindow(QMainWindow):
         if self._task_running:
             self._task_done(exit_code)
 
-    def _render_final_output(self, exit_code: int) -> None:
-        header_html = (
+    def _turn_html_for(
+        self,
+        *,
+        goal_line: str,
+        subtitle: str,
+        ack: str,
+        body_html: str,
+        status_html: str,
+    ) -> str:
+        """One turn's rendered HTML.
+
+        Shared by the live path and by conversation replay, so a resumed chat
+        is indistinguishable from one you never left. Building the two
+        separately is how they drift into looking subtly different, which
+        makes a resumed chat feel like a transcript rather than the chat.
+        """
+        header = (
             f'<div style="background:{theme.ACCENT_LIGHT};border:1px solid {theme.ACCENT_BORDER};'
             f'border-radius:14px;padding:12px 16px;margin-bottom:14px;">'
             f'<p style="color:{theme.ACCENT_PRESSED};font-size:15px;font-weight:700;margin:0 0 2px 0;">'
-            f'{_inline_md(self._goal_header.split(chr(10))[0])}</p>'
+            f'{_inline_md(goal_line)}</p>'
             f'<p style="color:{theme.TEXT_SECONDARY};font-size:12px;margin:0;">'
-            f'{_inline_md(self._goal_header.split(chr(10))[1] if chr(10) in self._goal_header else "")}</p>'
+            f'{_inline_md(subtitle)}</p>'
             f'</div>'
         )
+        if ack:
+            header += (
+                f'<p style="color:{theme.ACCENT_PRESSED};font-size:13px;'
+                f'font-style:italic;margin:0 0 14px 2px;">{_inline_md(ack)}</p>'
+            )
+        return f"{header}{body_html}{status_html}"
+
+    def _render_final_output(self, exit_code: int) -> None:
+        # The acknowledgement was streamed straight into the output pane while
+        # the task ran, and this render replaces the pane wholesale from
+        # _raw_buffer — which deliberately never held it. Passing it to
+        # _turn_html_for is what stops the fast reply vanishing the moment the
+        # slow one lands.
+        lines = self._goal_header.split(chr(10))
+        goal_line = lines[0]
+        subtitle = lines[1] if len(lines) > 1 else ""
 
         body = self._raw_buffer.replace("\r\n", "\n")
         sections = re.split(r"\n-{4,}\n", body)
@@ -1412,24 +2240,40 @@ class OrbitWindow(QMainWindow):
             if cleaned:
                 body_html += _md_to_html(cleaned)
 
-        ok = exit_code == 0
-        status_html = (
-            f'<div style="background:{theme.SUCCESS_BG if ok else theme.DANGER_BG};'
-            f'border:1px solid {theme.SUCCESS_BORDER if ok else theme.DANGER_BORDER};'
-            f'border-radius:10px;padding:8px 14px;margin-top:14px;">'
-            f'<span style="color:{theme.SUCCESS_TEXT if ok else theme.DANGER_TEXT};'
-            f'font-size:12px;font-weight:600;">● '
-            f'{"Task completed successfully" if ok else f"Task failed (exit {exit_code})"}'
-            f'</span></div>'
+        turn_html = self._turn_html_for(
+            goal_line=goal_line,
+            subtitle=subtitle,
+            ack=self._ack_text,
+            body_html=body_html,
+            status_html=self._status_card_html(exit_code),
         )
 
-        self.output_text.setHtml(
-            f'<div style="font-family:{theme.FONT_FAMILY};padding:4px;">'
-            f'{header_html}{body_html}{status_html}</div>'
+        # The pane is a THREAD, not a single exchange. Finished turns are kept
+        # and re-rendered above this one, so a conversation reads as a
+        # conversation — you can see what you asked two turns ago and what it
+        # said, which is most of what "conversational, not fire-and-forget"
+        # means from the user's side.
+        #
+        # Kept as rendered HTML rather than re-derived from the DB: the pane
+        # shows exactly what was shown at the time, including the streamed
+        # acknowledgement, which no table records.
+        self._turn_html.append(turn_html)
+        del self._turn_html[:-_MAX_THREAD_TURNS]
+
+        separator = (
+            f'<div style="border-top:1px solid {theme.BORDER};margin:22px 0 18px 0;">'
+            f'</div>'
         )
+        body = separator.join(self._turn_html)
+        self.output_text.setHtml(
+            f'<div style="font-family:{theme.FONT_FAMILY};padding:4px;">{body}</div>'
+        )
+        # Scrolled to the newest turn, not the top: in a thread the thing you
+        # want is the answer that just arrived.
         cursor = self.output_text.textCursor()
-        cursor.movePosition(cursor.MoveOperation.Start)
+        cursor.movePosition(cursor.MoveOperation.End)
         self.output_text.setTextCursor(cursor)
+        self.output_text.ensureCursorVisible()
 
     # ===================== output helpers =====================
 
@@ -1453,6 +2297,7 @@ class OrbitWindow(QMainWindow):
 
     def _clear_output(self) -> None:
         self.output_text.clear()
+        self._turn_html.clear()
         self._raw_buffer = ""
         self.step_tracker.reset()
         self.output_stack.setCurrentIndex(0)
@@ -1614,6 +2459,23 @@ class OrbitWindow(QMainWindow):
     def _tick_status(self) -> None:
         if self._task_running:
             self._update_status_context()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        """Release what the two voice tracks are holding.
+
+        The speech player keeps the audio output device open between replies
+        (re-opening it costs 0.90s), and the acknowledgement controller holds
+        a pooled HTTPS connection. Both are daemon-threaded and would die with
+        the process anyway; closing them explicitly means the audio device is
+        handed back promptly rather than whenever the interpreter gets round
+        to it, which is visible to other applications.
+        """
+        try:
+            self._speech.shutdown()
+            self._ack.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        super().closeEvent(event)
 
 
 def main() -> int:

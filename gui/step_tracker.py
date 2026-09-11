@@ -1,8 +1,28 @@
 """StepTracker — the Workbench's right-hand step rail.
 
-Parses the agent's phase markers ([STEP:START], [STEP:DONE], [STEP:FAIL],
-[STEP:PROGRESS]) and falls back to inferring a step from each tool call when
-the model emits no markers at all.
+A live progress meter, in the user's language. Driven by the `tool_call` /
+`tool_result` events the worker emits as ADK yields them (see
+`orbit/run_task.py`), not by anything the model says.
+
+## Two rules, both learned from getting it wrong
+
+**It is alive from submission, not from the first tool call.** `begin_task()`
+opens a running "Working out what to do" step the moment a goal is sent. The
+gap before the first tool call is not small — a cold worker plus MCP connect
+plus the first model turn measured 18.5s — and the rail used to sit completely
+empty through all of it, which reads as "nothing is happening" at exactly the
+moment the user is least sure anything is.
+
+**One row per PHASE, not per tool call.** An ordinary web browse makes ~40-50
+tool calls (navigate, snapshot, press-key, snapshot…) and used to render one
+step each. That is a transcript, not a meter. Tools map to a small set of
+plain-language phases and each phase occupies at most one row; repeats
+re-activate it and bump a "×N" counter. The same 41-call browse now renders 5
+steps. Targets: simple tasks ≤5 rows, complex ones 7-12.
+
+`handle_marker` still understands the old `[STEP:*]` markers so a stored
+transcript containing them renders, but nothing emits them any more — the
+prompt stopped asking on 2026-09-07.
 
 ## Why this is a fixed-width rail, not a card in the main column
 
@@ -52,34 +72,108 @@ from PySide6.QtWidgets import (
 
 from gui import theme
 
-_TOOL_STEP_MAP = {
-    "browser_open": "Opening browser",
-    "browser_navigate": "Navigating to page",
-    "browser_snapshot": "Observing web page",
-    "browser_click": "Clicking in browser",
-    "browser_type": "Typing in browser",
-    "browser_press_key": "Pressing key in browser",
-    "windows_open_app": "Opening application",
-    "windows_click": "Interacting with window",
-    "windows_type": "Typing text",
-    "windows_key": "Pressing shortcut",
-    "windows_scroll": "Scrolling window",
-    "windows_drag": "Dragging element",
-    "windows_batch_actions": "Executing UI actions",
-    "perception_capture_screenshot": "Observing the screen",
-    "perception_get_state": "Checking screen state",
-    "perception_get_uia_tree": "Reading UI structure",
-    "perception_find_element": "Finding UI element",
-    "perception_wait_for_visual_change": "Waiting for screen",
-    "run_command": "Running a command",
-    "read_file": "Reading file",
-    "write_file": "Writing file",
-    "list_files": "Listing files",
-    "fs_read_file": "Reading file",
-    "fs_write_file": "Writing file",
-    "memory_search_tasks": "Searching memory",
-    "memory_add": "Saving context",
+# ── Tool calls → PHASES, not one step per call ──────────────────────────────
+#
+# The rail used to add a step per distinct tool name, which meant an ordinary
+# web-browsing task rendered ~48 of them: navigate, snapshot, press-key,
+# snapshot, press-key, snapshot… That is a transcript, not a progress meter.
+# Nobody reads 48 steps, and the useful signal ("is it stuck?") is buried.
+#
+# Tools now map to a small set of PHASES in plain language — what a person
+# would say they were doing, not which function ran. Each phase appears at
+# most ONCE in the rail: a repeat re-activates the existing row and bumps a
+# counter rather than appending. So the list length is bounded by the number
+# of distinct phases a task touches, which in practice is:
+#
+#   simple web lookup   → Working out what to do, Opening a browser,
+#                         Going to a web page, Reading the page          = 4
+#   research + write-up → the above + Using the page + Saving files      = 6
+#   desktop automation  → + Opening an app, Looking at the screen,
+#                           Using the app                                = 7-9
+#
+# Phrasing rule: name the OUTCOME, not the mechanism. "Reading the page", not
+# "browser_snapshot". If you add a tool here, write what the user would say.
+_TOOL_PHASES = {
+    # thinking / recall
+    "memory_search_tasks": ("memory", "Checking what I've done before"),
+    "memory_get_context": ("memory", "Checking what I've done before"),
+    "memory_get_policy": ("memory", "Checking what I've done before"),
+    "memory_write": ("memory_write", "Saving something to remember"),
+
+    # web
+    "browser_open": ("browser_open", "Opening a browser"),
+    "browser_navigate": ("browse", "Going to a web page"),
+    "browser_go_back": ("browse", "Going to a web page"),
+    "browser_go_forward": ("browse", "Going to a web page"),
+    "browser_tab_new": ("browse", "Going to a web page"),
+    "browser_tab_select": ("browse", "Going to a web page"),
+    "browser_tab_list": ("browse", "Going to a web page"),
+    "browser_tab_close": ("browse", "Going to a web page"),
+    "browser_snapshot": ("read_page", "Reading the page"),
+    "browser_extract": ("read_page", "Reading the page"),
+    "browser_take_screenshot": ("read_page", "Reading the page"),
+    "browser_click": ("use_page", "Using the page"),
+    "browser_type": ("use_page", "Using the page"),
+    "browser_hover": ("use_page", "Using the page"),
+    "browser_select_option": ("use_page", "Using the page"),
+    "browser_press_key": ("use_page", "Using the page"),
+    "browser_drag": ("use_page", "Using the page"),
+    "browser_handle_dialog": ("use_page", "Using the page"),
+    "browser_close": ("browser_close", "Closing the browser"),
+
+    # desktop
+    "windows_open_app": ("open_app", "Opening an app"),
+    "windows_get_foreground_window": ("look_screen", "Looking at the screen"),
+    "perception_capture_screenshot": ("look_screen", "Looking at the screen"),
+    "perception_get_uia_tree": ("look_screen", "Looking at the screen"),
+    "perception_find_element": ("look_screen", "Looking at the screen"),
+    "perception_get_state": ("look_screen", "Looking at the screen"),
+    "perception_wait_for_visual_change": ("look_screen", "Looking at the screen"),
+    "perception_vision_locate": ("look_screen", "Looking at the screen"),
+    "ui_memory_lookup": ("look_screen", "Looking at the screen"),
+    "ui_memory_upsert": ("look_screen", "Looking at the screen"),
+    "windows_click": ("use_app", "Using the app"),
+    "windows_type": ("use_app", "Using the app"),
+    "windows_key": ("use_app", "Using the app"),
+    "windows_scroll": ("use_app", "Using the app"),
+    "windows_drag": ("use_app", "Using the app"),
+    "windows_wait": ("use_app", "Using the app"),
+    "windows_batch_actions": ("use_app", "Using the app"),
+
+    # files
+    "read_file": ("read_files", "Reading your files"),
+    "list_files": ("read_files", "Reading your files"),
+    "fs_read_file": ("read_files", "Reading your files"),
+    "fs_list_dir": ("read_files", "Reading your files"),
+    "fs_search": ("read_files", "Reading your files"),
+    "fs_get_metadata": ("read_files", "Reading your files"),
+    "write_file": ("write_files", "Saving files"),
+    "fs_write_file": ("write_files", "Saving files"),
+    "fs_move": ("write_files", "Saving files"),
+    "fs_copy": ("write_files", "Saving files"),
+    "fs_create_dir": ("write_files", "Saving files"),
+
+    # other
+    "run_command": ("command", "Running a command"),
+    "email_draft": ("email", "Working with email"),
+    "email_search": ("email", "Working with email"),
+    "email_read": ("email", "Working with email"),
+    "email_list_threads": ("email", "Working with email"),
+    "calendar_list_events": ("email", "Working with your calendar"),
+    "calendar_create_event": ("email", "Working with your calendar"),
 }
+
+# The step every task opens with, so the rail is never blank while the model
+# is deciding what to do. That gap is not small: a cold worker plus MCP
+# connect plus the first model turn measured 18.5s before the first tool call,
+# and the rail used to show nothing at all for the whole of it — which is
+# exactly when a user most wants to know something is happening.
+_THINKING_PHASE = ("thinking", "Working out what to do")
+
+# Kept for stored transcripts that still contain the old per-tool labels, and
+# because test fixtures reference it. Nothing writes it any more.
+_TOOL_STEP_MAP = {name: label for name, (_key, label) in _TOOL_PHASES.items()}
+
 
 _NODE = 22          # node diameter, per the design
 _ICON_W = 26        # icon column width
@@ -103,6 +197,11 @@ class Step:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     is_inferred: bool = False
+    # Which phase this row represents, and how many tool calls have rolled
+    # into it. `phase` is what makes a repeat re-activate this row instead of
+    # appending a new one.
+    phase: str = ""
+    repeats: int = 0
 
     def elapsed(self) -> str:
         if self.started_at is None:
@@ -481,18 +580,75 @@ class StepTracker(QFrame):
         self._refresh_all_widgets()
         self._scroll_to_bottom()
 
-    def handle_tool_call(self, tool_name: str, args_preview: str = "") -> None:
-        """Infer a step from a tool call when no explicit marker is active."""
-        clean = tool_name.strip().lower()
-        description = _TOOL_STEP_MAP.get(clean) or f"Executing {clean.replace('_', ' ')}"
+    def begin_task(self) -> None:
+        """Open the rail with a running 'thinking' step.
 
-        running = next((s for s in self.steps if s.status == StepStatus.RUNNING), None)
+        Called at submission, before anything has happened. Without it the
+        rail sits empty through the whole gap between submitting and the first
+        tool call — measured at 18.5s on a cold worker — which reads as
+        "nothing is happening" at exactly the moment the user is least sure.
+
+        The step's elapsed timer ticks once a second, so even an idle rail is
+        visibly alive.
+        """
+        self.reset()
+        phase, label = _THINKING_PHASE
+        step = Step(
+            description=label,
+            status=StepStatus.RUNNING,
+            started_at=time.time(),
+            is_inferred=True,
+            phase=phase,
+        )
+        self.steps.append(step)
+        self._add_step_widget(step)
+        self._activate()
+
+    def handle_tool_call(self, tool_name: str, args_preview: str = "") -> None:
+        """Fold a tool call into its PHASE.
+
+        Each phase occupies at most one row: a repeat re-activates the
+        existing one and bumps its counter. That is what keeps an ordinary
+        browse at four steps instead of the ~48 it used to produce, and it is
+        why the rail can be read at a glance rather than scrolled.
+        """
+        clean = tool_name.strip().lower()
+        phase, description = _TOOL_PHASES.get(clean, ("", ""))
+        if not phase:
+            # An unregistered tool still collapses on itself — keyed by its
+            # own name — so a new tool cannot flood the rail before someone
+            # gets round to giving it a phase.
+            phase = f"tool:{clean}"
+            description = f"Working on {clean.replace('_', ' ')}"
+
+        # An explicit [STEP:*] marker outranks inference and is never displaced.
+        running = next((x for x in self.steps if x.status == StepStatus.RUNNING), None)
+        if running is not None and not running.is_inferred:
+            return
+
+        # The opening 'thinking' step is finished by the first real tool call —
+        # working out what to do is over once something is being done.
+        for existing in self.steps:
+            if existing.phase == _THINKING_PHASE[0] and existing.status == StepStatus.RUNNING:
+                existing.status = StepStatus.DONE
+                existing.finished_at = time.time()
+
+        existing = next((x for x in self.steps if x.phase == phase), None)
+        if existing is not None:
+            # Same phase again: re-open the row rather than adding another.
+            if running is not None and running is not existing:
+                running.status = StepStatus.DONE
+                running.finished_at = time.time()
+            existing.status = StepStatus.RUNNING
+            existing.finished_at = None
+            existing.repeats += 1
+            if existing.repeats > 1:
+                existing.progress_detail = f"×{existing.repeats}"
+            self._refresh_all_widgets()
+            self._scroll_to_bottom()
+            return
+
         if running is not None:
-            # An explicit marker outranks inference: never displace a real step.
-            if not running.is_inferred:
-                return
-            if running.description == description:
-                return
             running.status = StepStatus.DONE
             running.finished_at = time.time()
 
@@ -501,10 +657,26 @@ class StepTracker(QFrame):
             status=StepStatus.RUNNING,
             started_at=time.time(),
             is_inferred=True,
+            phase=phase,
+            repeats=1,
         )
         self.steps.append(step)
         self._add_step_widget(step)
         self._activate()
+
+    def complete_current(self) -> None:
+        """Mark the running inferred step done — its tool returned.
+
+        Only touches inferred steps: an explicit [STEP:START] marker spans a
+        whole phase and several tool calls, so a single tool returning does
+        not end it.
+        """
+        running = next((s for s in self.steps if s.status == StepStatus.RUNNING), None)
+        if running is None or not running.is_inferred:
+            return
+        running.status = StepStatus.DONE
+        running.finished_at = time.time()
+        self._refresh_all_widgets()
 
     # -- widgets --------------------------------------------------------------
 

@@ -155,7 +155,7 @@ def test_tool_call_fallback(qapp):
     # Tool call triggers step creation
     tracker.handle_tool_call("browser_open")
     assert len(tracker.steps) == 1
-    assert tracker.steps[0].description == "Opening browser"
+    assert tracker.steps[0].description == "Opening a browser"
     assert tracker.steps[0].status == StepStatus.RUNNING
     assert tracker.steps[0].is_inferred is True
 
@@ -167,7 +167,7 @@ def test_tool_call_fallback(qapp):
     tracker.handle_tool_call("browser_navigate")
     assert len(tracker.steps) == 2
     assert tracker.steps[0].status == StepStatus.DONE
-    assert tracker.steps[1].description == "Navigating to page"
+    assert tracker.steps[1].description == "Going to a web page"
     assert tracker.steps[1].status == StepStatus.RUNNING
 
 

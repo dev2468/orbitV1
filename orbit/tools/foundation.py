@@ -92,22 +92,32 @@ class ToolResult(BaseModel):
 
 
 class Confidence:
-    """Section 7's confidence-based execution gating, scored by how an
-    action was grounded."""
+    """How well an action was grounded, on one 0-1 scale.
+
+    These scores are real and load-bearing: every `ElementRef` carries one,
+    and `windows_control_tools._require_confidence` refuses to actuate
+    anything below `min_actuation_confidence` (0.70, in
+    `windows_control_policy.yaml`). That is what stops a vision guess
+    (VISION_INFERRED, 0.50) or a raw {x, y} from moving the mouse on its own.
+
+    **There used to be a `gate()` here** implementing Section 7's three-way
+    rule — >0.90 execute, 0.70-0.90 reverify, <0.70 surface — reached through
+    `policy.confidence_gate()`. Both were deleted on 2026-09-08 because
+    nothing ever called either one. The runtime implements a different and
+    better rule: a flat floor plus a single-use human approval token, which
+    gives a below-floor action an auditable way through that "reverify" never
+    specified. Keeping a constant that described a system nobody had built
+    made the codebase look like it had two gates when it had one.
+
+    If the three-way rule is ever wanted, write it where it is enforced, not
+    here.
+    """
 
     API_SUCCESS = 1.0
     UIA_AUTOMATION_ID = 0.95
     UIA_NAME_MATCH = 0.80
     OCR_MATCH = 0.60
     VISION_INFERRED = 0.50
-
-    @staticmethod
-    def gate(confidence: float) -> Literal["execute", "reverify", "surface"]:
-        if confidence > 0.90:
-            return "execute"
-        if confidence >= 0.70:
-            return "reverify"
-        return "surface"
 
 
 # --- secret redaction -------------------------------------------------------

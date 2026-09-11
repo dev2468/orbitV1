@@ -1,7 +1,8 @@
 # gui/ — PySide6 dashboard (Studio design direction)
 
-Six modules. `theme.py` holds every token, `main.py` is the window, `step_tracker.py` the right-hand
-step rail, `history_view.py` the History tab, `voice.py` the F9 voice pipeline and its modal, and
+Nine modules. `theme.py` holds every token, `main.py` is the window, `step_tracker.py` the right-hand
+step rail, `history_view.py` the History tab, `voice.py` the F9 voice pipeline and its modal,
+`speech.py` the voice going back out, `ack_controller.py` the fast reply that voice speaks, `spend.py` the daily voice budgets, and
 `stats.py` the pure arithmetic behind the analytics.
 
 `gui/` has no `__init__.py`; `gui.main` resolves as a namespace package.
@@ -82,8 +83,149 @@ The sentinel is matched in `_read_stdout` and **deliberately not appended to `_r
 `_task_done` guards on `self._task_running` because both the sentinel and `QProcess.finished` can
 arrive for the same task (Stop kills the worker); the guard makes the UI restore exactly once.
 
+## Progress arrives as events now, not as prose the model remembered to print
+
+The worker interleaves `[ORBIT]{json}` lines with its normal output, one per thing that happens, and
+`_handle_orbit_event` acts on them: `tool_call` opens a step, `tool_result` closes it, `text_delta`
+types the answer into the pane, `result` unlocks the input. Like the `[TASK:DONE]` sentinel these
+lines are kept out of `_raw_buffer`, for the same reason — the final render would print raw JSON.
+
+**This replaced a step rail built from `[STEP:*]` markers the model was instructed to print.** Two
+things were wrong with that. The markers were only as reliable as the model's compliance, and they
+could not arrive at all until the task was over, because the worker used ADK's `run_debug`, which
+buffers every event and returns them at the end. Measured on a two-phase task: the first tool call
+was knowable at +8.5s and the GUI learned about it at +12.9s along with everything else.
+`_STEP_RE` and `handle_marker` are still here so a stored transcript containing markers renders, but
+nothing emits them any more — the prompt no longer asks for them.
+
+`result` is emitted by the worker *before* it tears down its six MCP subprocesses (2-3s), and
+`_on_result_ready` unlocks on it rather than waiting for `[TASK:DONE]`. Those seconds used to be
+spent looking at a finished answer with a dead input box.
+
+`_EVENT_PREFIX` is copied from `orbit.run_task.EVENT_PREFIX` rather than imported, because importing
+that module would pull litellm and google-adk (10.6s of imports) into the GUI process.
+`test_progress_events.py` asserts the two copies match.
+
 **Standing rule, unchanged: this process never writes task or event rows to `orbit.db`.**
 `TaskManager` owns the in-memory task/token registry and a direct write would desync it.
+
+## The acknowledgement track: `ack_controller.py` + `speech.py`
+
+`_submit_task` starts **two** things, and the acknowledgement goes first —
+before the worker is even written to. That ordering is the whole feature: the fast reply is spoken
+at ~2.0s while the worker is still connecting MCP servers for the same goal. Anything that makes
+`self._ack.start(...)` wait on the work track defeats it.
+
+`AckController` runs `orbit.ack` on a daemon thread and cancels by **generation counter**, not by
+killing the thread — an HTTP read cannot be interrupted safely mid-stream, so a superseded run
+finishes and its output is discarded. One wasted short completion beats a torn connection that the
+*next* acknowledgement would pay to re-establish.
+
+`SpeechPlayer` is a queue, not a function. Two costs drove its shape, both measured here:
+
+- **the first HTTPS request costs ~0.9s** against 0.27s warm — and abandoning a response part-way
+  leaves the pooled connection unusable, so `prewarm()` drains its throwaway response to the end.
+  That looks wasteful and is the point.
+- **`sd.RawOutputStream` open+start costs 0.90s**, so the output stream is opened once and held,
+  closing after `_IDLE_CLOSE_SECONDS` of silence rather than per utterance.
+
+Together those took first-audio from 1.39s to 0.30s. Both prewarms are skipped when
+`ORBIT_DISABLE_PREWARM` is set, which `tests/conftest.py` does — otherwise every GUI test would make
+a real network call and grab the machine's audio device.
+
+Aura bills per character and **nothing else in this codebase watches that** (`db.get_daily_cost` has
+no callers), so `SpendGuard` keeps its own daily budget in `data/voice_usage.json` (see `gui/spend.py`, which guards microphone seconds too). Deliberately not an
+events row — see the standing rule above.
+
+**A transcript submits itself** (`_AUTO_SUBMIT_MS`, 900ms). `_on_transcript_ready` arms a timer
+rather than waiting for Enter — requiring a keypress after speaking meant every spoken goal ended at
+the keyboard, which is the thing voice exists to avoid.
+
+**The work track is held until the ack classifies the turn** — `_defer_work` / `_dispatch_pending_work`
+/ `_on_ack_classified`. `hold_full` is passed explicitly rather than derived from `hold_ms`, because
+the two durations do not order the way the intent does: the headless guard (3s) is deliberately
+*longer* than the foreground hold (2.5s), one being a rarely-reached ceiling and the other a window
+that always elapses. Inferring intent from duration got this backwards and the tests caught it.
+
+**A CHAT turn ends on `_on_ack_completed`, not on `_on_ack_classified`.** Classification fires on the
+stream's first tokens with the sentence still arriving, and `_task_done` re-renders the pane
+wholesale — finishing early rendered half a sentence and appended the rest underneath.
+
+**Speech is spoken only for goals that arrived by voice.** `_on_transcript_ready` sets
+`_voice_originated`; `_submit_task` latches it into `_spoken_submission` and clears it, so clearing
+the box mid-task cannot change whether the reply already in flight gets spoken. The acknowledgement
+itself runs for typed goals too — it just appears on screen instead.
+
+The ack is streamed into the output pane live and **kept out of `_raw_buffer`**, so
+`_render_final_output` re-adds it from `_ack_text`. Without that the fast reply vanishes the moment
+the slow one lands.
+
+## The step rail: phases, and alive from submission
+
+Two things were wrong and both are worth not re-introducing.
+
+**One step per tool call made an ordinary browse render ~48 rows.** Tools now map to a small set of
+plain-language PHASES (`_TOOL_PHASES`), each occupying at most one row; a repeat re-activates that
+row and bumps a `×N` counter. The same 41-call browse renders 5. Targets are ≤5 rows for a simple
+task, 7-12 for a complex one, and `test_a_realistic_browse_stays_readable` pins the ceiling. When
+adding a tool, name the **outcome** ("Reading the page"), not the mechanism ("browser_snapshot").
+
+**The rail used to be empty for the part of a task where feedback matters most.** Events were always
+live — that was fixed on 2026-09-07 — but there is nothing to show before the model's first tool
+call, and that gap measured 18.5s on a cold worker. `begin_task()` now opens a running "Working out
+what to do" step at submission, closed by the first real tool call. Its elapsed timer ticks every
+second, so even an idle rail is visibly alive.
+
+## The output pane is a thread
+
+Finished turns are kept as rendered HTML in `_turn_html` and re-rendered above the live one, so a
+conversation reads as a conversation. It used to `clear()` on every submission, which made
+"conversational" true of the model and false of the screen.
+
+Kept as rendered HTML rather than re-derived from the DB, because the pane should show what was
+actually shown — including the streamed acknowledgement, which no table records. Bounded at
+`_MAX_THREAD_TURNS` (20): `QTextEdit` re-lays out its whole document on `setHtml`, so an unbounded
+thread makes every later turn slower to render. Full history lives in the History tab regardless.
+
+Starting a new chat sends `{"close_conversation": ...}` to the worker before clearing the thread —
+otherwise the abandoned conversation's runner keeps six MCP subprocesses and a browser alive with
+nothing ever coming back to them.
+
+## Resuming an earlier chat
+
+"Recent ▾" in the nav bar lists the last 12 conversations; picking one calls `_resume_conversation`,
+which points `_conversation_id` at it and rebuilds `_turn_html` from `db.conversation_turns`.
+
+**The worker needed nothing for this.** Sending a goal with an existing conversation_id already
+replayed that conversation's stored turns into the prompt (`run_task._build_conversation_context`),
+which is the same bridge used after a worker restart — so resuming worked before any of this UI
+existed. All the GUI adds is putting the thread back on screen.
+
+Replayed turns go through the same `_turn_html_for` the live path uses. Building them separately is
+how the two drift into looking different, which would make a resumed chat feel like a transcript
+rather than the chat.
+
+Three things that are deliberate:
+
+- **A resumed chat is lower fidelity than one you never left.** A live conversation continues the
+  real ADK session — actual tool calls, arguments, results. A resumed one gets a summary with
+  results clipped to 500 chars and only the last `_MAX_CONTEXT_TURNS` (8) replayed. "Do that again"
+  works; "why did that fail" will not have the error text.
+- **A turn with no goal is skipped.** An interrupted task leaves a row with nothing in it, and a
+  blank card in the thread reads as a rendering bug rather than an abandoned turn.
+- **Resuming is refused mid-task**, and releases the previous conversation's runner on the way out —
+  each one holds six MCP subprocesses and possibly a browser.
+
+The menu is rebuilt on `aboutToShow` rather than on a timer: the query is cheap, and a stale picker
+is the one thing that makes this feel broken.
+
+## A finished task reports HOW it finished
+
+`_status_card_html` reads `_result_status` / `_result_text`, captured from the `result` event, and
+falls back to the exit code only when no event arrived. That distinction is the point: `[TASK:DONE 1]`
+cannot tell a provider outage from a cancel from a tool bug, and rendering all three as
+"Task failed (exit 1)" told the user none of it. A cancel is styled neutral, not red — the user asked
+for it, and colouring it as an error says otherwise.
 
 ## The confirmation channel is the one deliberate DB-write exception
 

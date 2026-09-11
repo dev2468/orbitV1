@@ -1,0 +1,152 @@
+# Local-machine access policy — the `devmcp` toolset.
+#
+# Read at call time by orbit.mcp_servers.devmcp_tools; not cached, so an edit
+# here takes effect on the next tool call without a restart (the convention
+# every YAML in this directory follows).
+#
+# ── Why this file exists ────────────────────────────────────────────────────
+#
+# Until 2026-09-08 this toolset was an external server at
+# C:\Users\HP\Desktop\MCP\server.py, outside the repository. Vendoring it made
+# a fresh clone work — and reading it on the way in found that the security
+# layer the project's own docs described did not exist:
+#
+#     # Security restrictions disabled — all PowerShell commands are allowed.
+#     DANGEROUS_PATTERNS = re.compile(r'(?!)')  # never matches
+#     def is_command_allowed(command): return True, ""
+#
+# So `run_command` ran arbitrary PowerShell unrestricted, which also made the
+# write-path allowlist decorative: `Set-Content` reaches anywhere the user can
+# write. This file is that missing layer, written for real.
+#
+# ── What it does NOT claim ──────────────────────────────────────────────────
+#
+# A blocklist over a Turing-complete shell is a guard rail, not a sandbox. A
+# determined agent can obfuscate around any pattern here (encoded commands,
+# string building, aliases), and this file does not pretend otherwise. What it
+# buys is that the *obvious* catastrophic mistakes — recursive deletes, disk
+# formatting, downloading and executing a script, disabling the firewall —
+# fail closed instead of running because nobody had written a rule.
+#
+# The real containment is that every call still passes through SafetyPlugin
+# and is registered in risk_tiers.yaml (invariants 2 and 3). This is the layer
+# below that, specific to what a shell can do.
+
+# ── run_command ─────────────────────────────────────────────────────────────
+
+command:
+  # Seconds before a command is killed and reaped. Long enough for a pip
+  # install or a real script, short enough that a hung process does not hold
+  # a task open indefinitely.
+  timeout_s: 120
+
+  # Truncation applied to each of stdout and stderr independently, so a
+  # runaway loop cannot flood the model's context (and the bill) with output.
+  max_output_chars: 20000
+
+  # Case-insensitive regular expressions matched against the whole command
+  # string. A match refuses the call outright — there is no confirmation path
+  # here, and `permission_denied` tells the model not to retry or route round.
+  #
+  # Grouped by what they protect. Add to the right group with a comment
+  # saying why, rather than appending to the end of the list.
+  denied_patterns:
+    # -- irreversible destruction of data -----------------------------------
+    - '\bformat(-volume)?\b'
+    - '\bremove-item\b[^|]*\s-recurse\b[^|]*\s-force\b'
+    - '\brd\s+/s\b'
+    - '\brmdir\s+/s\b'
+    - '\bdel\s+/[sq]\b'
+    - '\bclear-disk\b'
+    - '\binitialize-disk\b'
+    - '\bremove-partition\b'
+    - '\bcipher\s+/w\b'
+
+    # -- fetch-and-execute: the classic remote compromise shape -------------
+    # Downloading a script and piping it straight into an interpreter turns
+    # any prompt injection on a web page into arbitrary code execution.
+    - 'invoke-webrequest[\s\S]*\|\s*(iex|invoke-expression)'
+    - 'invoke-restmethod[\s\S]*\|\s*(iex|invoke-expression)'
+    - '\b(curl|wget)\b[\s\S]*\|\s*(iex|invoke-expression|bash|sh)\b'
+    - '\bstart-bitstransfer\b[\s\S]*\|\s*(iex|invoke-expression)'
+
+    # -- evading this policy ------------------------------------------------
+    # An encoded command is unreadable to every rule above it, so it is
+    # refused on principle rather than decoded and re-checked.
+    - '-encodedcommand\b'
+    - '\bfrombase64string\b'
+    - 'set-executionpolicy\b[\s\S]*\b(unrestricted|bypass)\b'
+    - '\b(iex|invoke-expression)\b'
+
+    # -- turning the machine's defences off ---------------------------------
+    - 'set-mppreference\b[\s\S]*disablerealtimemonitoring'
+    # No leading \b on `firewall`: the real command is `netsh advfirewall`,
+    # and a word boundary before "firewall" never matches inside
+    # "advfirewall". The pattern was written with one and silently matched
+    # nothing until a test tried the actual command.
+    - '\bnetsh\b[\s\S]*firewall[\s\S]*\b(off|disable)\b'
+    - '\bbcdedit\b'
+    - '\bvssadmin\b[\s\S]*\bdelete\b'
+    - '\bwbadmin\b[\s\S]*\bdelete\b'
+
+    # -- credential and account access --------------------------------------
+    - '\bnew-localuser\b'
+    - '\badd-localgroupmember\b[\s\S]*administrators'
+    - '\bnet\s+user\b[\s\S]*/add\b'
+    - '\bmimikatz\b'
+    - '\bget-credential\b'
+
+    # -- taking the machine away from its user ------------------------------
+    - '\b(stop-computer|restart-computer)\b'
+    - '\bshutdown\b\s+/[rs]\b'
+    - '\bdisable-computerrestore\b'
+
+# ── write_file ──────────────────────────────────────────────────────────────
+
+write:
+  # Roots the agent may write into, as absolute paths. `~` is expanded, and a
+  # path must be INSIDE one of these — compared segment-wise after resolution,
+  # not by string prefix, so a sibling directory whose name merely starts the
+  # same way ("Downloads-evil") is refused rather than accepted. The external
+  # server compared with startswith() and had exactly that hole.
+  #
+  # Symlinks are resolved before the check, so a link planted inside an
+  # allowed root cannot redirect a write outside one.
+  allowed_roots:
+    - ~/Downloads
+    - ~/Desktop/orbit-out
+
+  # Refused anywhere, even inside an allowed root. Same lowercased-substring
+  # match as filesystem_policy.yaml's denylist, and the same reasoning: it is
+  # what stops a later-widened root from quietly exposing secrets.
+  denylist_keywords:
+    - .env
+    - .git
+    - .ssh
+    - id_rsa
+    - credentials
+    - .aws
+    - .npmrc
+    - appdata/roaming/microsoft/windows/start menu/programs/startup
+
+  # A single write past this is refused. Not a security boundary — a sanity
+  # limit, so a model looping on write_file cannot fill the disk.
+  max_bytes: 5000000
+
+# ── read_file / list_files ──────────────────────────────────────────────────
+#
+# Reading is deliberately NOT root-scoped. The whole point of this toolset is
+# "the user's real files", and a read cannot damage anything. The denylist
+# below is about not pulling secrets into the model's context — and therefore
+# into the event log and the provider's logs — rather than about access.
+
+read:
+  max_chars: 50000
+  max_listing_entries: 200
+  denylist_keywords:
+    - .env
+    - id_rsa
+    - .ssh/
+    - credentials.json
+    - .aws/
+    - .npmrc

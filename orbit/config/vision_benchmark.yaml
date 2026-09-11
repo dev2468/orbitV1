@@ -29,6 +29,17 @@ arms:
     prompt_shape: set_of_mark
     model: null
 
+  # --- model comparison, enabled 2026-09-08 ------------------------------
+  # Both prompt shapes on a second, stronger multimodal model, so the pair
+  # answers two questions at once: does a better model close the freeform
+  # gap, and does set-of-mark still win once the model is good?
+  - id: gemini25_point
+    prompt_shape: point
+    model: openrouter/google/gemini-2.5-flash
+  - id: gemini25_som
+    prompt_shape: set_of_mark
+    model: openrouter/google/gemini-2.5-flash
+
 candidates:
   # How many numbered boxes the set_of_mark arm draws, the answer included.
   # 12 is a judgement call, not a measurement: enough distractors that

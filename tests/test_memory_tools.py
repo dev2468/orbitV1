@@ -95,3 +95,69 @@ def test_no_code_path_deletes_a_memory_row():
         assert "def memory_delete" not in src
         assert "def delete_memory" not in src
     assert not hasattr(db, "delete_memory")
+
+
+# --- source_urls -------------------------------------------------------------
+#
+# `tasks.source_urls` was created as '[]' by the original schema and read back
+# by memory_search_tasks, but nothing ever wrote it — so every past task
+# reported no sources. It is now derived from the events table when a task
+# reaches a terminal state.
+
+
+def test_source_urls_are_derived_from_browser_navigations():
+    from orbit import db
+
+    task = db.create_task("research", goal="find a tv")
+    db.log_event(task, tool_call="browser_navigate", args={"url": "https://example.com/a"})
+    db.log_event(task, tool_call="browser_snapshot", args={})
+    db.log_event(task, tool_call="browser_navigate", args={"url": "https://example.com/b"})
+    db.update_task_status(task, "COMPLETED", result="done")
+
+    import json as _json
+    assert _json.loads(db.get_task(task)["source_urls"]) == [
+        "https://example.com/a", "https://example.com/b",
+    ]
+
+
+def test_source_urls_deduplicate_and_keep_visit_order():
+    from orbit import db
+    import json as _json
+
+    task = db.create_task("research", goal="g")
+    for url in ("https://b.test/", "https://a.test/", "https://b.test/"):
+        db.log_event(task, tool_call="browser_navigate", args={"url": url})
+    db.update_task_status(task, "COMPLETED")
+
+    assert _json.loads(db.get_task(task)["source_urls"]) == [
+        "https://b.test/", "https://a.test/",
+    ]
+
+
+def test_a_task_that_never_browsed_keeps_an_empty_list():
+    from orbit import db
+
+    task = db.create_task("local work", goal="read a file")
+    db.log_event(task, tool_call="read_file", args={"filepath": "C:/x.txt"})
+    db.update_task_status(task, "COMPLETED")
+    assert db.get_task(task)["source_urls"] == "[]"
+
+
+def test_non_http_navigation_arguments_are_ignored():
+    """A refused file:// attempt is not a source."""
+    from orbit import db
+
+    task = db.create_task("t", goal="g")
+    db.log_event(task, tool_call="browser_navigate", args={"url": "file:///etc/passwd"})
+    db.log_event(task, tool_call="browser_navigate", args={"nope": 1})
+    db.update_task_status(task, "COMPLETED")
+    assert db.get_task(task)["source_urls"] == "[]"
+
+
+def test_source_urls_are_not_derived_before_the_task_finishes():
+    from orbit import db
+
+    task = db.create_task("t", goal="g")
+    db.log_event(task, tool_call="browser_navigate", args={"url": "https://example.com/"})
+    db.update_task_status(task, "RUNNING")
+    assert db.get_task(task)["source_urls"] == "[]"

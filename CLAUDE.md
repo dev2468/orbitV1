@@ -16,7 +16,10 @@ Three things define the target, and every design decision should be checked agai
    custom-drawn controls). Everything else here is table stakes; this is the differentiator. See
    "The vision tier and the approval path" below, which is the most important section in this file.
 2. **It is conversational, not fire-and-forget.** The goal is a smooth back-and-forth, not a
-   one-shot command line. **This does not exist yet** — see "Distance to the north star".
+   one-shot command line. **Reached, as of 2026-09-08**: speech in and out, a transcript that submits
+   itself, a spoken reply in ~2s, barge-in, a threaded view, and — the structural half — a real ADK
+   session reused across the turns of a conversation, so turn two continues turn one's actual
+   history rather than a summary of it.
 3. **It is the user's, not ours.** Open source, running locally on the user's Windows box, against
    whatever LLM they choose to point it at. Model-agnostic by construction (`KNOWN_MODELS` +
    `ORBIT_MODEL`), never hardcoded to one provider.
@@ -25,52 +28,61 @@ Practical consequences: prefer generality over demo-specific special cases; keep
 and never widen the safety layer for convenience — an agent with real mouse and keyboard control that
 users are asked to trust *is* its safety story.
 
-## Current status (2026-09-06)
+## Current status (2026-09-11)
 
 Working today, verified:
 
 - **CLI**: persistent REPL, one-shot goals, `--foreground` lane, `--serve` warm-worker mode.
-- **GUI** (`gui/main.py`): full task submission, live output stream, step rail, task history with
-  analytics, and the approvals drawer. Studio (warm/organic) design direction, implemented.
-- **Voice input**: F9 global hotkey → mic → Deepgram Nova-3 streaming STT → live transcript → goal
-  box. Modal with commit/discard exits.
+- **GUI** (`gui/main.py`): full task submission, a threaded output pane, a live step rail in plain
+  language, a model selector, **Recent ▾ to resume earlier chats**, task history with analytics,
+  and the approvals drawer. Studio (warm/organic) design direction, implemented.
+- **Voice, both directions**: F9 global hotkey → mic → Deepgram Nova-3 streaming STT → live
+  transcript → goal box (modal with commit/discard exits), and Deepgram Aura TTS back out
+  (`gui/speech.py`). One `DEEPGRAM_API_KEY` covers both.
+- **Voice is the primary input**: a finished transcript submits itself. The spoken acknowledgement
+  arrives ~2s later and is the confirmation; Esc cancels at any point; F9 while Orbit is talking
+  interrupts it. See "Two tracks, not one" below.
+- **It talks back**: the acknowledgement, and then a speech-shaped summary of the finished task.
 - **Warm worker**: the GUI spawns one `run_task --serve` process and feeds it goals over stdin,
   removing ~7-8s of cold start per task.
-- **Seven toolsets**: six MCP servers in this repo (browser-policy, memory, filesystem,
-  windows-control, communication, screen-perception) plus **Dev-MCP**, which proxies a server
-  living *outside* the repo and gives the agent sandboxed PowerShell and broad file access. Every
-  task carries Dev-MCP, in both lanes.
+- **Seven toolsets, all in this repo**: browser-policy, memory, filesystem, windows-control,
+  communication, screen-perception, and **devmcp** — PowerShell plus local file access, vendored
+  in-repo on 2026-09-08 with the policy layer the external version turned out to be missing. Every
+  task carries devmcp, in both lanes.
 - **Vision tier**: implemented, and — new — a human can now approve a single vision-guessed action.
-- **354 tests collected**, all passing except opt-in live-UI ones. Some hit the network and cost
+- **552 tests collected**, all passing except one opt-in live-UI test. Some hit the network and cost
   tokens; see `tests/CLAUDE.md`.
 
-**Voice integration exists.** Earlier revisions of this file said it did not — that referred to an
-older build whose voice code was deleted on the `remove-voice-integration` branch. It was rebuilt
-from scratch on `voice-integration` (Deepgram only; no TTS, no Kokoro, no second venv). If you find a
-doc claiming voice is absent, the doc is stale.
+**Voice integration exists, in both directions.** Earlier revisions of this file said voice was
+absent — that referred to an older build whose voice code was deleted on the
+`remove-voice-integration` branch. It was rebuilt from scratch on `voice-integration`, and speech
+output was added on 2026-09-07. Deepgram for both halves; still no Kokoro and no second venv, which
+is what the old TTS stack needed. If you find a doc claiming voice is absent or input-only, it is
+stale.
 
 ## Stack
 
 - Python **3.13.7** (`venv/`). One venv. (`venv_tts/`, the isolated 3.11 environment that existed
-  only to run Kokoro TTS, is gone along with all TTS code.)
+  only to run Kokoro TTS, is gone. Speech output came back via Deepgram Aura, which needs no local
+  model and therefore no second environment.)
 - `mcp>=1.24,<2` — mcp 2.x moved `mcp.shared.session`, which breaks google-adk 2.6.3's `MCPToolset`
   import. Installed: mcp 1.29.0, google-adk 2.6.3. **Do not unpin.**
 - SQLite at `data/orbit.db` (WAL). Playwright MCP via `npx`. PySide6 for the GUI. `mss` for
   screen-perception's screenshots (pure-Python, no system binary — not the catalog's named DXCam).
-- `sounddevice` + `numpy` for mic capture; `deepgram-sdk` 7.x for streaming STT.
+- `sounddevice` + `numpy` for mic capture and audio playback; `deepgram-sdk` 7.x for both
+  streaming STT (Nova-3) and TTS (Aura). `httpx` directly, for the acknowledgement track only.
 
 ### Models — all LLM calls go through OpenRouter
 
 One credential, `OPENROUTER_API_KEY`, reaches every model. `DEEPGRAM_API_KEY` is separate and only
 voice uses it. Both live in `.env`.
 
-- **Committed default**: `openrouter/google/gemini-3.7-flash`.
-- **Currently in the working tree, uncommitted**: `DEFAULT_MODEL` switched to
-  `openrouter/openai/gpt-6-astra` — an in-flight experiment, not a settled decision.
-- **Vision tier**: `openrouter/google/gemma-3-27b-it`, its own LiteLLM call
-  (`_VISION_MODEL` in `perception_tools.py`).
-- Override per-run with `ORBIT_MODEL` in `.env`; `--list-models` prints the catalog and the active
-  model.
+- **Default**: `openrouter/google/gemini-2.5-flash`, chosen on measured latency (2026-09-07).
+- **Vision tier**: `openrouter/google/gemini-2.5-flash`, its own LiteLLM call (`_VISION_MODEL` in
+  `perception_tools.py`). It was `gemma-3-27b-it` until the 2026-09-08 benchmark — see the vision
+  section for the numbers that changed it.
+- Pick per task from the GUI's model selector, or override with `ORBIT_MODEL` in `.env`;
+  `--list-models` prints the catalog (`orbit/models.py`) and the active model.
 
 **Effort** (`ORBIT_EFFORT`, the GUI's Low/Medium/High selector, and the `effort` field in a
 `--serve` JSON line) is **not** a reasoning-effort parameter in the provider sense. It selects a
@@ -79,11 +91,17 @@ temperature and token ceiling from `_EFFORT_CONFIGS` in `agent.py`: low `0.3/409
 rather than erroring. So "high effort" buys a longer leash and more variance, not a different
 thinking mode.
 
-⚠️ **`gpt-6-astra` is not in `KNOWN_MODELS`, and `gemini-3.7-flash`'s entry there still says
-"Default."** So `--list-models` currently reports `Active: openrouter/openai/gpt-6-astra` while
-labelling a different model as the default. Whichever way that experiment settles, fix the catalog
-with it — `KNOWN_MODELS` is also the list of models verified to support tool calling, and one that
-does not cannot drive this agent at all.
+⚠️ **Do not make a reasoning model the default without measuring it first.**
+`gemini-3.7-flash` was the default until 2026-09-07 and cost roughly 3 seconds on *every turn of
+every task*, including "hi". OpenRouter will not let that be turned off for it — `reasoning:
+{max_tokens: 0}` is refused with "Reasoning is mandatory for this endpoint", and `effort: low` only
+trimmed 225 reasoning tokens to 181. Measured, same prompt, streaming: first content at 3.27s
+(3.7-flash) against 0.90s (2.5-flash) and 1.08s (claude-haiku-4-5). 3.7-flash is still the better
+model for hard planning and vision work — reach for it with `ORBIT_MODEL`, not as the default that
+conversation pays for.
+
+`KNOWN_MODELS` is also the list of models verified to support tool calling; one that does not cannot
+drive this agent at all.
 
 ## Setup
 
@@ -101,15 +119,61 @@ skip to Commands.
    vendors it; without Node the browser toolset fails at first use, not at import.
 4. **`.env` in the project root:**
    - `OPENROUTER_API_KEY` — required. Every agent and vision call goes through it.
-   - `DEEPGRAM_API_KEY` — only for F9 voice. Absent, voice prints a diagnostic and does nothing;
-     everything else runs.
-   - `ORBIT_MODEL` — optional per-run model override.
-5. **Dev-MCP's external server**, if you want that toolset to start —
-   `C:\Users\HP\Desktop\MCP\server.py` with its own venv. It is **not** in this repo and is
-   hardcoded. See Distance to the north star; this is the step a fresh clone cannot complete.
+   - `DEEPGRAM_API_KEY` — voice, both directions (Nova-3 in, Aura out). Absent, voice prints a
+     diagnostic and does nothing; everything else runs, including the acknowledgement track, which
+     just appears on screen instead of being spoken.
+   - `ORBIT_MODEL` — optional per-run model override for the work track.
+   - `ORBIT_ACK_MODEL` — optional override for the acknowledgement track only. Keep it fast; the
+     work track can be slow and strong without dragging the spoken reply down with it.
+   - `ORBIT_TTS_VOICE` — Deepgram Aura voice, default `aura-asteria-en`. The Aura-2 voices sound
+     better and take ~6x as long to synthesise (0.3s vs 1.9s); see `gui/speech.py`.
+   - `ORBIT_TTS_DAILY_CHAR_CAP` — daily synthesis budget in characters, default 100,000. 0 disables
+     the cap.
+   - `ORBIT_STT_DAILY_SECOND_CAP` — daily microphone budget in seconds, default 3,600. The mic
+     refuses to open once it is spent, and says so. Both budgets live in `data/voice_usage.json`.
+   - `ORBIT_AUTO_SUBMIT_MS` — delay between a finished transcript and it submitting itself,
+     default 900. See "Timing rules that are load-bearing".
+   - `ORBIT_VOICE_HOLD_MS` — how long a **foreground** goal is held so the spoken acknowledgement
+     can land and be cancelled before the mouse moves, default 2500.
+That is the whole list. Dev-MCP used to be a sixth step — an external server on its own venv,
+outside the repository — and is now in-repo (`orbit/mcp_servers/devmcp_server.py`), so a fresh
+clone starts every toolset. `ORBIT_DEVMCP_EXTERNAL=1` restores the old external server for
+comparison.
 
 First run is slower than it looks and neither pause is a hang: LiteLLM's first call takes ~18s to
 warm up (subsequent ~1s), and Playwright's `npx` cold start takes ~60s.
+
+## Where the time goes
+
+Measured 2026-09-08 on the author's machine, warm worker. Re-measure before trusting any of it;
+these numbers moved by 5-8x in two days and will move again.
+
+| | |
+| --- | --- |
+| Transcript → auto-submit | 0.9s (`ORBIT_AUTO_SUBMIT_MS`) |
+| Ack model call, classification | ~1.0s (its first tokens) |
+| Ack complete → Deepgram Aura → **first spoken word** | **~2.2-4.0s total** |
+| **A purely social turn ends here** | **~3.4-4.0s**, no work track at all |
+| MCP connect, 6 servers in parallel | 1.3s |
+| Work track answer, trivial goal | ~5.4s |
+| Work track answer, one tool call | ~10-12s |
+| Answer → spoken summary | ~1.1s |
+
+Three fixes account for most of it, and each is documented where it lives:
+
+1. **The default model was a reasoning model** whose thinking OpenRouter will not let you disable —
+   ~3s per turn of the agent loop, paid by "hi". See the ⚠️ under Models.
+2. **`run_debug` buffered every event** until the task ended, so nothing could be shown while it
+   ran. Now `run_async` + a structured event stream — see `orbit/CLAUDE.md`.
+3. **Every MCP server imported `google.adk`** through `orbit/policy.py` to read a YAML file: 1.96s
+   each, six in parallel, every task. Splitting `policy.py` from `safety_plugin.py` took the
+   headless connect from 9.44s to 1.29s — see `orbit/CLAUDE.md`.
+
+**Within a conversation, MCP servers are no longer respawned per turn.** A conversation reuses its
+runner (`run_task._RUNNER_CACHE`), and `SafetyPlugin` stamps the true task_id onto every tool call,
+so a long-lived server still attributes its events correctly. Measured: first turn 13.2s, follow-ups
+4.5s and 4.9s. A one-off task with no conversation still spawns fresh; `orbit/CLAUDE.md` explains
+why that cache must stay sequential.
 
 ## Commands
 
@@ -123,7 +187,7 @@ venv\Scripts\python.exe -m orbit.run_task find the cheapest 65 inch tv   # one-s
 venv\Scripts\python.exe -m orbit.run_task --foreground open notepad ...  # opts into lane=foreground — the ONLY way windows-control tools are reachable (one-shot only, not inside the REPL)
 venv\Scripts\python.exe -m orbit.run_task --serve                        # warm-worker mode: reads one JSON goal per line from stdin. What the GUI spawns; not meant to be typed at by hand
 venv\Scripts\python.exe -m orbit.run_task --list-models                  # known-good models + active one
-venv\Scripts\python.exe -m pytest tests\ -q                              # 354 tests (some hit the network; a live-UI windows-control test is opt-in, see tests/CLAUDE.md)
+venv\Scripts\python.exe -m pytest tests\ -q                              # 552 tests (some hit the network; a live-UI windows-control test is opt-in, see tests/CLAUDE.md)
 venv\Scripts\python.exe -m eval.run_eval                                 # eval harness against live sites
 ```
 
@@ -131,6 +195,94 @@ The REPL, the one-shot form and `--serve` all call the exact same `run_task()`. 
 execution path — each goal is one call, one `task_id`, one row through
 `TaskManager`/`SafetyPlugin`/the events table. They differ only in how a goal arrives and whether the
 process stays up between goals.
+
+## Two tracks, not one
+
+A goal now starts two independent things at once, because they answer different
+questions on different timescales:
+
+```
+  spoken goal ──▶ transcript ──▶ auto-submits after ~0.9s
+      │
+      ├──▶ ACK TRACK   orbit/ack.py + gui/ack_controller.py + gui/speech.py
+      │      one small model, NO tools, ~400-token prompt
+      │      classifies [CHAT]/[TASK] at ~1s, spoken at ~2.2s
+      │                      │
+      │                      └── [CHAT] ──▶ the work track never runs.
+      │                                     A social turn ends here, ~3.4s.
+      │
+      └──▶ WORK TRACK  orbit/run_task.py --serve  (everything below)
+             dispatched only once classified [TASK]
+             44 tools, ~8,000-token prompt, MCP connect ~3.3s
+             answer ~9s ──▶ spoken summary ~1.1s later
+```
+
+The ack track exists because the work track cannot be made fast enough to
+*answer* in a second — it has six MCP servers to connect and an 8,000-token
+prompt to send — and a person who has just spoken should not get silence for
+that long. So the fast track answers the smaller question ("what did I just
+hear") while the slow one gets on with the job.
+
+Rules that keep it honest:
+
+- **The ack never does the work and never guesses at results.** Its prompt
+  forbids answering the request. If it ever starts reporting outcomes, the two
+  tracks can disagree, and the fast one will be wrong.
+- **It runs in the GUI process**, which is what makes the two genuinely
+  concurrent — the worker is single-threaded and, at that exact moment, busy
+  connecting servers for this very goal.
+- **So `orbit/ack.py` must stay dependency-light.** It talks to OpenRouter over
+  raw `httpx` rather than LiteLLM, because `import litellm` costs 8.7s and the
+  GUI would pay it at startup.
+- **A failed ack is not a failed task.** The tracks share nothing but the goal
+  string; either can die without the other noticing.
+- Speech is spoken only for goals that *arrived by voice*. Typed goals get the
+  ack on screen — someone at a keyboard did not ask to be talked at.
+
+### The classification, and the one rule it must never break
+
+The ack's first tokens are `[CHAT]` or `[TASK]`, and the work track is **held
+until that arrives** (~1s). A social turn therefore never spawns six MCP
+servers: "thanks, that was great" finishes in ~3.4s instead of ~9s.
+
+**A real task must never fail to be dispatched.** Every failure path —
+classification error, provider timeout, no marker at all, an unparseable
+reply — resolves to TASK and sends the work. A `_dispatch_guard` timer sends
+it regardless after 3s. The asymmetry is the whole design: a wasted worker
+turn costs seconds, while a wrongly-confident CHAT means a request the user
+made silently does nothing.
+
+If the classification is wrong anyway, the goal is left in the input box and
+re-submitting it verbatim forces the work track. That is the recovery path,
+and it is why it needs no new widget.
+
+### Why the spoken summary is a second model call
+
+Speaking a task's result means re-writing it: agent answers are markdown with
+bullets, URLs and file paths, and reading those aloud is noise. The obvious
+alternative — asking the agent to emit `<speech>…</speech>` in its own answer —
+was rejected for the reason the `[STEP:*]` markers were deleted from that same
+prompt: an instruction buried among forty others in an 8,000-token prompt gets
+followed when the model feels like it, and the failure is silent. Speech that
+sometimes does not happen is worse than speech that costs a second, and that
+second is free anyway — the user is already reading the real answer.
+
+### Timing rules that are load-bearing
+
+- **Auto-submit is ~0.9s, not a "review the transcript" window.** The spoken
+  ack is the confirmation, arriving a second later and saying out loud what was
+  understood. A window long enough to *read* a transcript would push first audio
+  from ~2s to ~4.5s and undo the point of the whole arrangement.
+- **The foreground lane holds the full window even once classified** (2.5s,
+  `ORBIT_VOICE_HOLD_MS`). It is the lane that moves the real mouse, so the
+  spoken ack must land, and be cancellable, before anything touches the OS.
+  Headless does not need it: its first seconds are MCP connect, which is inert.
+- **Esc is the universal no**, ordered most-recent-intent first: cancel the
+  recording, else cancel a pending auto-submit, else drop a goal not yet sent,
+  else silence speech, else close the drawer.
+- **F9 while Orbit is talking interrupts it.** Barge-in is how people actually
+  talk, and without it the hotkey queues you behind an answer you have moved on
+  from.
 
 ## Architecture
 
@@ -142,23 +294,26 @@ process stays up between goals.
   orbit.run_task --serve  ───────────▶  run_task(title, goal)  ◀────────┘
   (one warm process, [TASK:DONE n])      │
                                          │  db.create_task ─▶ tasks row
+                                         │  (a conversation reuses its runner,
+                                         │   its ADK session and its MCP servers —
+                                         │   see run_task's _RUNNER_CACHE)
                                          ▼
                         TaskManager.submit(lane)   foreground: single-flight lock
                                                    headless:  semaphore(5)
                                          │
                                          ▼
-                      ADK InMemoryRunner + SafetyPlugin (policy.py)
+                 ADK InMemoryRunner + SafetyPlugin (safety_plugin.py)
                                          │  before_tool / after_tool / on_error / before_model
                                          ▼
-                  MCPToolset ── stdio subprocess, env={ORBIT_TASK_ID}
+                  MCPToolset ── stdio subprocess; task_id stamped on every call
                        ├──▶ browser-policy server ────▶ Playwright MCP subprocess
                        ├──▶ memory server ────────────▶ orbit/db.py
                        ├──▶ filesystem server ────────▶ data/fs_workspace (scoped)
                        ├──▶ windows-control server ───▶ real mouse/keyboard (lane="foreground" only)
                        ├──▶ communication server ─────▶ swappable MailBackend (today: local SQLite stand-in)
                        ├──▶ screen-perception server ─▶ read-only: UIA tree, screenshots (mss), vision
-                       └──▶ Dev-MCP (EXTERNAL) ───────▶ C:\Users\HP\Desktop\MCP\server.py — outside
-                                                        this repo, own venv. PowerShell + file access.
+                       └──▶ devmcp server ────────────▶ PowerShell + local files, behind
+                                                        orbit/config/devmcp_policy.yaml
 
   Human-in-the-loop:  windows_control tool ──▶ orbit/confirmation.py ──▶ pending_confirmations table
                                                        │                         ▲
@@ -177,7 +332,7 @@ These hold no matter which file you are in.
 
 1. **Everything reaches the model through an MCP server.** A tool that is not exposed by
    `orbit/mcp_servers/` is not reachable by the agent, by construction.
-2. **Every tool call goes through `SafetyPlugin`** (`orbit/policy.py`). There is no second path into
+2. **Every tool call goes through `SafetyPlugin`** (`orbit/safety_plugin.py`). There is no second path into
    a tool and no "just this once" bypass.
 3. **`orbit/config/risk_tiers.yaml` is a hard allowlist.** A tool name not listed there is blocked
    outright, before tier logic runs. There is deliberately no fallback tier — restoring a soft
@@ -238,7 +393,31 @@ The model's self-reported confidence is recorded under
 image and records `unanimous`/`majority`/`split` under `element.state["vision"]["agreement"]` as a
 diagnostic only. Consistency is not correctness — a model can be confidently and repeatably wrong.
 
-**The original spike's dataset does not exist.** The VISION TIER comment block reports 76% over 46
+**There is a real accuracy number now, measured 2026-09-08.** `benchmarks/grounding_bench.py` was
+run for the first time, four arms over 12 targets on committed synthetic fixtures:
+
+| arm | model | shape | hit rate | median miss |
+| --- | --- | --- | --- | --- |
+| freeform_point | gemma-3-27b-it | point | 17% | 122 px |
+| set_of_mark | gemma-3-27b-it | set-of-mark | 58% | 96 px |
+| gemini25_point | gemini-2.5-flash | point | 67% | 23 px |
+| **gemini25_som** | **gemini-2.5-flash** | **set-of-mark** | **83%** | **34 px** |
+
+It found two real bugs in the process, both now fixed:
+
+1. **`_VISION_PROMPT` never stated an output format**, so the model answered in prose and
+   `_parse_vision_reply` rejected it. **10 of 12 replies were unparseable** — `perception_vision_locate`
+   was failing in production roughly 83% of the time, returning `tool_failure`. The prompt had been
+   written for a model that emits point JSON natively and did not move when `_VISION_MODEL` did.
+2. **The vision model was the binding constraint.** Swapping `gemma-3-27b-it` for
+   `gemini-2.5-flash` moved point-grounding 17%→67% and set-of-mark 58%→83%, cutting the median miss
+   from 122px to ~30px. `_VISION_MODEL` now points at the latter.
+
+Quote these as *"arm X beat arm Y by N points on the synthetic set"*, never as "Orbit's vision tier is
+83% accurate" — see `benchmarks/CLAUDE.md` on why synthetic fixtures are not field accuracy. The
+`dense` category scored 1/3 even at its best; small tightly-packed targets are the weak spot.
+
+**The original spike's dataset still does not exist.** The VISION TIER comment block reports 76% over 46
 targets on 10 screenshots and states outright that those inputs were never checked in. Verified
 absent: nothing outside `venv/`, nothing in `automation_spikes/`, nothing in any commit. That 76% is
 a historical note and **not** a baseline anything can be compared against. `benchmarks/` exists to
@@ -252,7 +431,7 @@ hosted model call, and that the two tiers do not take the same kind of input.
 
 ## Module map
 
-Every source file and what it is for. 49 files; the ones with no entry here are `__init__.py`.
+Every source file and what it is for. 57 files; the ones with no entry here are `__init__.py`.
 Directory-level detail lives in that directory's own `CLAUDE.md` (next section).
 
 ### `orbit/` — core runtime
@@ -262,9 +441,12 @@ Directory-level detail lives in that directory's own `CLAUDE.md` (next section).
 | `agent.py` | Builds the one `LlmAgent`: model selection, the instruction, and which toolsets the lane gets. `build_agent(lane=…)` is the enforcement point for the foreground gate. |
 | `run_task.py` | The single execution path. REPL, one-shot CLI and `--serve` all funnel into `run_task()`. |
 | `task_manager.py` | Two-lane scheduler — foreground is a single-flight lock (one mouse), headless a semaphore(5). |
-| `policy.py` | `SafetyPlugin`: the allowlist check, tier gate, retry caps, failure classification, and history compaction. Every tool call passes through it. |
+| `policy.py` | Policy **data**: the YAML readers, the risk-tier vocabulary, `classify_failure`. No ADK import — thirteen call sites want only this half. |
+| `safety_plugin.py` | `SafetyPlugin`: the allowlist check, tier gate, retry caps, failure classification, and history compaction. Every tool call passes through it. |
 | `db.py` | SQLite store — tasks, events, memory, `pending_confirmations`, `ui_memory`. Owns the FTS5 triggers and the approval-token rules. |
 | `confirmation.py` | Human-in-the-loop approval for actions the confidence gate refuses. Writes the row, asks console or GUI, mints the single-use token. |
+| `ack.py` | The acknowledgement track's model call. Raw `httpx` to OpenRouter, no tools, no LiteLLM, no ADK — see "Two tracks, not one". Keep it dependency-light. |
+| `models.py` | The model catalog (`KNOWN_MODELS`, `DEFAULT_MODEL`). Kept litellm-free so the GUI's model selector can read it without paying an 8.7s import. |
 | `degradation.py` | The user-facing message when the provider call dies. |
 | `tools/foundation.py` | `BaseTool` / `ToolResult` / `ToolError`. Timeout, cancellation, redaction and event logging live in `execute()` so a tool author cannot skip them. |
 | `tools/element_ref.py` | `ElementRef` — the shape perception produces and windows-control consumes. Carries the `confidence` the actuation gate reads. |
@@ -277,6 +459,7 @@ That split is deliberate — the server handles protocol, the tools module handl
 | File | Purpose |
 | --- | --- |
 | `browser_policy_server.py` / `_tools.py` | Proxies Playwright MCP behind URL policy. Spawns a Playwright subprocess per session. |
+| `devmcp_server.py` / `_tools.py` | Local machine access: any-folder listing, text reads, policy-scoped writes, policy-checked PowerShell. Vendored in-repo 2026-09-08. |
 | `windows_control_server.py` / `_tools.py` | Real mouse/keyboard actuation. Holds `_require_confidence` — the floor and the approval-token escape. |
 | `perception_server.py` / `_tools.py` | Read-only screen observation: UIA tree, screenshots, and the vision tier. |
 | `memory_server.py` / `_tools.py` | The agent's access to its own task history. |
@@ -297,7 +480,7 @@ skill's `tool_filter` is invisible to the model regardless of what the server im
 | --- | --- | --- |
 | `memory.py` | memory — the agent's own task history | both |
 | `screen_perception.py` | screen-perception — read-only observation | both |
-| `devmcp.py` | **an external server outside this repo** — PowerShell + file access | both |
+| `devmcp.py` | devmcp — PowerShell + local file access (in-repo since 2026-09-08) | both |
 | `windows_control.py` | windows-control — real mouse/keyboard | **foreground only** |
 | `research_product.py` | browser-policy — Playwright web research | **headless only** |
 | `filesystem.py` | filesystem — scoped `fs_workspace` sandbox | headless only |
@@ -312,7 +495,9 @@ sandbox, so both would be redundant *and* ambiguous about which one to reach for
 
 `windows_control.py` being absent from headless is the visibility half of the lane gate — a headless
 agent has no function declaration for `windows_click` at all, so it cannot call it, full stop.
-`devmcp.py` is the one to know about; see Distance to the north star.
+`devmcp.py` carries the most powerful tools in the system. Its policy is
+`orbit/config/devmcp_policy.yaml`, and the Distance section below is plain about what a blocklist
+over a shell does not buy.
 
 ### `gui/` — PySide6 dashboard
 
@@ -323,7 +508,10 @@ agent has no function declaration for `windows_click` at all, so it cannot call 
 | `step_tracker.py` | The 220px right-hand step rail. |
 | `history_view.py` | History tab — KPI tiles, filters, task list, inspector. |
 | `stats.py` | Pure arithmetic behind the KPIs and every duration string. No Qt, so it is testable without a widget tree. |
-| `voice.py` | F9 hotkey, Deepgram session, the orb, and the voice modal. |
+| `voice.py` | F9 hotkey, Deepgram Nova-3 session, the orb, and the voice modal. Speech **in**. |
+| `speech.py` | Deepgram Aura synthesis and playback. Speech **out**. Owns the daily spend guard. |
+| `ack_controller.py` | Qt wrapper over `orbit/ack.py` — runs the fast reply off the GUI thread. |
+| `spend.py` | Daily voice budgets for both directions — Aura characters, Nova-3 seconds — in `data/voice_usage.json`. |
 
 ### `benchmarks/` and `eval/`
 
@@ -335,12 +523,12 @@ end-to-end harness against live sites.
 
 | Read this when you are touching… | File |
 | --- | --- |
-| `agent.py`, `run_task.py`, `task_manager.py`, `db.py`, `policy.py`, `degradation.py`, `confirmation.py`, or the `lane` gate | `orbit/CLAUDE.md` |
+| `agent.py`, `run_task.py`, `task_manager.py`, `db.py`, `policy.py`, `safety_plugin.py`, `degradation.py`, `confirmation.py`, or the `lane` gate | `orbit/CLAUDE.md` |
 | any tool implementation, the `BaseTool`/`ToolResult`/`ToolError` contract, or `ElementRef` | `orbit/tools/CLAUDE.md` |
 | any MCP server, browser sessions, the reaper, filesystem scoping, windows-control actuation, the communication backend, screen-perception, `uia_resolver.py`, untrusted-content wrapping | `orbit/mcp_servers/CLAUDE.md` |
 | `MCPToolset` wiring, `tool_filter`, how `task_id` reaches a server subprocess | `orbit/skills/CLAUDE.md` |
 | any `*.yaml` under `orbit/config/`, or adding/retiering a tool | `orbit/config/CLAUDE.md` |
-| the GUI, the theme tokens, the step rail, voice, or the analytics arithmetic | `gui/CLAUDE.md` |
+| the GUI, the theme tokens, the step rail, voice in or out, the acknowledgement track, or the analytics arithmetic | `gui/CLAUDE.md` |
 | writing or fixing a test, or a DB-isolation surprise | `tests/CLAUDE.md` |
 | the eval harness or a failing eval case | `eval/CLAUDE.md` |
 | vision grounding accuracy, prompt-shape or model comparisons | `benchmarks/CLAUDE.md` |
@@ -355,33 +543,21 @@ Design intent and the section numbers the code cites live in
 Not bugs — the named gaps between what exists and what this is meant to become. Roughly ordered by
 how much they block the goal.
 
-- **There is no conversation.** Every goal is an isolated session: `run_task()` builds a fresh
-  `InMemoryRunner` and a session keyed by `task_id`, so nothing carries from one goal to the next.
-  "Do that again but in Chrome" cannot work today. This is the single largest gap against north-star
-  #2, and it is an architectural change rather than a feature — session reuse, a turn history that
-  survives a task, and a GUI that shows a thread rather than a one-shot output pane. Note that
-  `SafetyPlugin.before_model_callback` already compacts history *within* a task; that machinery is
-  the right starting point, not a second one.
-- **Vision is the USP but has no trustworthy accuracy number.** The only figure that exists (76%) is
-  from a dataset that was never committed. `benchmarks/` is the intended replacement and should be
-  run and reported before anyone claims a number publicly.
-- **Dev-MCP hardcodes a path outside the repo, and every task loads it.**
-  `orbit/skills/devmcp.py` spawns `C:\Users\HP\Desktop\MCP\server.py` — a server that is not in this
-  repository, has its own Python 3.14 venv, and exists only on the author's machine. It is wired into
-  **both** lanes in `build_agent`, so a fresh clone gets a toolset it cannot start, and the tools it
-  exposes (`run_command` — PowerShell — plus `read_file`/`write_file` over arbitrary paths) are among
-  the most powerful in the system. Its four tools *are* registered in `risk_tiers.yaml`, so invariant
-  3 holds and nothing is bypassing policy. But for the open-source goal this is a hard blocker in two
-  ways: the path must be vendored or made configurable, and the capability needs documenting rather
-  than arriving as a surprise. This is the largest single obstacle to anyone else running Orbit.
-- **No LICENSE and no README.** The project is meant to be open source and currently has neither, so
-  it is not actually publishable. A license choice is the user's call, not one to make by default.
+- **Vision accuracy is measured now, but only on synthetic fixtures.** 83% on the best arm
+  (`gemini-2.5-flash` + set-of-mark) over 12 targets — see the vision section above for the full
+  table and the two bugs the first run caught. What is still missing is a *real-screenshot* set:
+  these scenes are drawn in code, which buys exact ground truth and reproducibility at the cost of
+  real Windows chrome. A model that has seen a million real screenshots may do better or worse on an
+  actual Notepad. Twelve targets is also a small n.
+- **The `run_command` blocklist is a guard rail, not a sandbox.** `devmcp_policy.yaml` refuses the
+  obvious catastrophes — recursive deletes, fetch-and-execute, disabling the firewall or AV, taking
+  the machine down — but it is a pattern list over a Turing-complete shell, and a determined agent
+  can obfuscate around it. Real containment would mean a job object or a restricted-token
+  container. Worth knowing before anyone describes this as sandboxed.
 - **The communication server has no real mailbox.** `LocalMailBackend` is a genuinely working local
   SQLite stand-in, not stubs — but nothing sent through it reaches a real inbox. Connecting Gmail /
   IMAP needs a human to provision credentials first; that is account access, not something buildable
   unattended. `email_send` is blocked regardless.
-- **Model choice is not exposed in the UI.** North star #3 says the user picks the brain, but that
-  means editing `.env` today. The GUI has an effort selector and no model selector.
 - **Windows-control is one-shot-CLI only.** `--foreground` is not reachable from inside the REPL, and
   the GUI's lane toggle is the only other way in. For an agent whose pitch is "controls your apps",
   that is a narrow door.
@@ -393,25 +569,16 @@ Do not spend a session rediscovering these.
 - **`data/orbit.db`'s `memory` table holds only attack payloads.** All rows are
   `provenance='external'` prompt-injection seeds written by `tests/test_adversarial.py`. Nothing in
   real use has ever written a memory row. Do not read it as representative data.
-- **`browser_open` inherits the 30s default tool timeout** against a Playwright MCP cold start that
-  takes ~60s (`npx -y @playwright/mcp@latest`). The 60s on the toolset's `StdioConnectionParams`
-  does not cover it — the tool's own `asyncio.wait_for` is the shorter one.
-- **`Confidence.gate()` is never called by the runtime.** Confidence values are recorded on every
-  `ToolResult` and thrown away; the three-way rule (>0.90 execute / 0.70–0.90 reverify / <0.70
-  surface) exists only in the constant and its unit test.
-  `windows_control_tools._require_confidence` implements an adjacent but different check — a flat
-  floor plus the approval-token escape, not the three-way split.
-- **`db.purge_old_events()` and `close_sessions_for_task()` have no callers.** Both implemented and
-  correct; nothing invokes them, so retention never runs.
-- **`tasks.source_urls` is never written.** Created as `'[]'` and read back by
-  `memory_search_tasks`, so every past task reports no sources.
-- **`db.get_daily_cost` has no callers.** Its one caller was the old voice runtime's daily
-  transcription cost cap, removed with that code. The rebuilt voice integration does **not** cap
-  spend — worth knowing, since Deepgram bills per minute of audio.
+- **`browser_open`'s first call is slow, but no longer times out.** `OpenSessionTool` sets
+  `default_timeout_s = 90.0`, which covers the ~60s `npx -y @playwright/mcp@latest` cold start
+  that the 30s `BaseTool` default did not. It is still a ~60s wait the first time in a session,
+  so warm the browser once before demoing anything web-facing.
+- **`db.get_daily_cost` still has no callers — but voice spend is capped now, both directions.**
+  `gui/spend.py` keeps two daily budgets in `data/voice_usage.json`: characters for Aura (TTS) and
+  seconds of microphone audio for Nova-3 (STT). It is deliberately not an events-table row, because
+  the GUI process never writes those. `get_daily_cost` is still the right home for a cap on a
+  *tool's* spend, and nothing uses it.
 - **screen-perception has no OCR tier.** `perception_read_text_region` is not implemented: no OCR
   engine is installed (Tesseract needs a system binary; PaddleOCR/EasyOCR are multi-hundred-MB ML
   stacks). `perception_find_element` honestly reports `"ocr"` in `tiers_unavailable` rather than
   pretending otherwise. The vision tier partly covers the same ground.
-- **`run_task.py`'s top-level `except Exception` reports every failure as a provider outage.** A tool
-  bug, a DB error and a cancelled coroutine all surface to the user as "the model provider call
-  failed". Narrow the catch before trusting that message.

@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import json
 import secrets
+import logging
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
+
+logger = logging.getLogger("orbit.db")
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "orbit.db"
 
@@ -152,6 +155,18 @@ CREATE TABLE IF NOT EXISTS ui_memory (
     UNIQUE(process_name, element_desc)
 );
 
+-- A conversation is a sequence of turns (each turn is a task). This is
+-- the structural layer for north-star #2 ("conversational, not
+-- fire-and-forget"). A conversation_id on a task is optional — tasks
+-- without one are standalone (the current default behaviour).
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id TEXT PRIMARY KEY,
+    title           TEXT NOT NULL DEFAULT '',
+    lane            TEXT NOT NULL DEFAULT 'headless',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type);
@@ -203,9 +218,32 @@ def get_connection() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Forward-only migrations that ALTER existing tables.
+
+    Each is guarded by a column-existence check so it is safe to re-run on
+    every startup (same pattern as CREATE TABLE IF NOT EXISTS).
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "conversation_id" not in cols:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN conversation_id TEXT "
+            "REFERENCES conversations(conversation_id)"
+        )
+    if "turn_index" not in cols:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN turn_index INTEGER"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_conversation "
+        "ON tasks(conversation_id)"
+    )
+
+
 def init_db() -> None:
     with get_connection() as conn:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
 
 
 def create_task(
@@ -217,6 +255,8 @@ def create_task(
     parent_task: Optional[str] = None,
     model: Optional[str] = None,
     task_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    turn_index: Optional[int] = None,
 ) -> str:
     if lane not in LANES:
         raise ValueError(f"invalid lane: {lane!r}")
@@ -227,9 +267,12 @@ def create_task(
         conn.execute(
             """INSERT INTO tasks
                (task_id, title, status, lane, risk_tier, goal, parent_task,
-                model, source_urls, created_at)
-               VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?, '[]', ?)""",
-            (task_id, title, lane, risk_tier, goal, parent_task, model, _now()),
+                model, source_urls, created_at, conversation_id, turn_index)
+               VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?, '[]', ?, ?, ?)""",
+            (
+                task_id, title, lane, risk_tier, goal, parent_task,
+                model, _now(), conversation_id, turn_index,
+            ),
         )
     return task_id
 
@@ -244,15 +287,68 @@ def update_task_status(
     if status not in TASK_STATUSES:
         raise ValueError(f"invalid status: {status!r}")
     completed_at = _now() if status in _TERMINAL_STATUSES else None
+    # `tasks.source_urls` existed since the original schema, was created as
+    # '[]', read back by memory_search_tasks — and never written by anything,
+    # so every past task reported no sources. Derived here, once, when the
+    # task reaches a terminal state.
+    #
+    # Derived rather than accumulated: the events table already records every
+    # browser_navigate with its arguments, so a second write path during the
+    # run would be a duplicate source of truth that could disagree with it.
+    sources = _derive_source_urls(task_id) if completed_at else None
     with get_connection() as conn:
         conn.execute(
             """UPDATE tasks
                SET status = ?, result = COALESCE(?, result),
                    failure_reason = COALESCE(?, failure_reason),
-                   completed_at = COALESCE(?, completed_at)
+                   completed_at = COALESCE(?, completed_at),
+                   source_urls = COALESCE(?, source_urls)
                WHERE task_id = ?""",
-            (status, result, failure_reason, completed_at, task_id),
+            (status, result, failure_reason, completed_at, sources, task_id),
         )
+
+
+# Tools whose arguments carry a URL the task actually visited. Deliberately a
+# short allowlist rather than "anything containing http": a blocklisted URL
+# that was refused, or one quoted inside a page's text, is not a source.
+_URL_BEARING_TOOLS = ("browser_navigate",)
+
+
+def _derive_source_urls(task_id: str) -> Optional[str]:
+    """JSON array of URLs this task navigated to, oldest first, deduplicated.
+
+    Returns None (leaving the column untouched) when the task visited
+    nothing, so a task that never browsed keeps its '[]' rather than being
+    rewritten to the same value on every status change.
+    """
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                "SELECT args FROM events WHERE task_id = ? AND tool_call IN "
+                f"({','.join('?' * len(_URL_BEARING_TOOLS))}) "
+                "ORDER BY event_id ASC",
+                (task_id, *_URL_BEARING_TOOLS),
+            ).fetchall()
+    except sqlite3.Error:
+        # Swallowed because a missing source list must never fail a task that
+        # otherwise succeeded — but note this hid a bug once: the column is
+        # `event_id`, and an earlier `ORDER BY id` raised in here silently, so
+        # every task derived an empty list and looked exactly like a task that
+        # had not browsed. tests/test_memory_tools.py pins the real behaviour.
+        logger.debug("source_urls derivation failed for %s", task_id, exc_info=True)
+        return None
+
+    seen: list[str] = []
+    for row in rows:
+        try:
+            args = json.loads(row["args"]) if row["args"] else {}
+        except (TypeError, ValueError):
+            continue
+        url = (args or {}).get("url") if isinstance(args, dict) else None
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            if url not in seen:
+                seen.append(url)
+    return json.dumps(seen) if seen else None
 
 
 def log_event(
@@ -483,6 +579,82 @@ def list_tasks(*, status: Optional[str] = None, limit: Optional[int] = None) -> 
             params.append(limit)
         rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+
+
+# --- conversations -----------------------------------------------------------
+
+
+def create_conversation(
+    *,
+    title: str = "",
+    lane: str = "headless",
+    conversation_id: Optional[str] = None,
+) -> str:
+    if lane not in LANES:
+        raise ValueError(f"invalid lane: {lane!r}")
+    conversation_id = conversation_id or f"CONV-{uuid.uuid4().hex[:12]}"
+    now = _now()
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO conversations
+               (conversation_id, title, lane, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (conversation_id, title, lane, now, now),
+        )
+    return conversation_id
+
+
+def get_conversation(conversation_id: str) -> Optional[dict]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_conversations(*, limit: int = 20) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM conversations ORDER BY updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def conversation_turns(conversation_id: str) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE conversation_id = ? "
+            "ORDER BY turn_index ASC",
+            (conversation_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def add_turn_to_conversation(
+    conversation_id: str, task_id: str
+) -> int:
+    """Link an existing task to a conversation as the next turn.
+    Returns the turn_index assigned."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(turn_index), -1) + 1 AS next_idx "
+            "FROM tasks WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        next_idx = row["next_idx"]
+        conn.execute(
+            "UPDATE tasks SET conversation_id = ?, turn_index = ? "
+            "WHERE task_id = ?",
+            (conversation_id, next_idx, task_id),
+        )
+        conn.execute(
+            "UPDATE conversations SET updated_at = ? "
+            "WHERE conversation_id = ?",
+            (_now(), conversation_id),
+        )
+    return next_idx
 
 
 # --- pending confirmations (human-in-the-loop approval) ---------------------

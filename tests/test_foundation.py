@@ -126,11 +126,42 @@ async def test_secret_redaction_in_logged_args():
     assert "REDACTED" in row["args"]
 
 
-def test_confidence_gate_thresholds():
-    assert Confidence.gate(0.95) == "execute"
-    assert Confidence.gate(0.90) == "reverify"  # boundary: not > 0.90
-    assert Confidence.gate(0.80) == "reverify"
-    assert Confidence.gate(0.5) == "surface"
+def test_confidence_scores_are_ordered_and_bounded():
+    """The scores are what the actuation floor compares against, so their
+    ORDER is the contract — a vision guess must never outrank a UIA match.
+
+    This replaced `test_confidence_gate_thresholds`, which tested a
+    `Confidence.gate()` that nothing in the runtime ever called. See the
+    class docstring: the real rule is a flat floor plus a human approval
+    token, enforced in windows_control_tools._require_confidence."""
+    assert (
+        Confidence.VISION_INFERRED
+        < Confidence.OCR_MATCH
+        < Confidence.UIA_NAME_MATCH
+        < Confidence.UIA_AUTOMATION_ID
+        < Confidence.API_SUCCESS
+    )
+    for score in (
+        Confidence.VISION_INFERRED, Confidence.OCR_MATCH,
+        Confidence.UIA_NAME_MATCH, Confidence.UIA_AUTOMATION_ID,
+        Confidence.API_SUCCESS,
+    ):
+        assert 0.0 <= score <= 1.0
+
+    # The floor that actually governs actuation. A vision guess sits below it
+    # by design; raising VISION_INFERRED above it would open a path from a
+    # visual guess straight to a real mouse click.
+    from orbit.policy import load_windows_control_policy
+
+    floor = load_windows_control_policy().get("min_actuation_confidence", 0.70)
+    assert Confidence.VISION_INFERRED < floor
+    assert Confidence.UIA_AUTOMATION_ID >= floor
+
+
+def test_confidence_gate_is_gone():
+    """Deleted 2026-09-08 — it described a three-way rule the runtime never
+    implemented. If something re-adds it, that something should enforce it."""
+    assert not hasattr(Confidence, "gate")
 
 
 @pytest.mark.asyncio

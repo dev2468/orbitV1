@@ -1,6 +1,6 @@
 # orbit/ — core runtime
 
-`agent.py` builds it, `run_task.py` drives it, `task_manager.py` schedules it, `policy.py` polices
+`agent.py` builds it, `run_task.py` drives it, `task_manager.py` schedules it, `safety_plugin.py` polices
 it, `db.py` records it, `degradation.py` is what the user sees when the provider dies.
 
 ## Two-lane scheduler (`task_manager.py`)
@@ -38,7 +38,25 @@ check between awaits, and a hard cancel alone can land in the middle of an actio
 `CancellationToken` is defined here and reused by `orbit/tools/foundation.py` on purpose — one
 cancellation story for the whole system, not two that drift.
 
-## SafetyPlugin's four callbacks (`policy.py`)
+## `policy.py` is data, `safety_plugin.py` is enforcement — and why they split
+
+They were one file until 2026-09-08. The split is a layering fix: thirteen call sites import
+`policy.py` — every MCP server, the GUI, `confirmation.py` — and **every one of them wants only a
+`load_*` YAML reader**. None wants the ADK plugin, because ADK runs in the parent process and a tool
+server has no agent to police.
+
+The cost of that mismatch was not theoretical. `import google.adk` measured **1.96s of a 2.04s**
+import for `orbit.mcp_servers.memory_tools`, and six MCP servers paid it *in parallel* on every
+single task, contending for the CPU as they went. Connecting the headless toolset measured **9.44s**
+under load. After the split it measures **1.29s**, and is now flat in the number of servers — which
+is why the plan to drop the `communication` toolset for speed was abandoned: it would buy 0.15s and
+cost a capability.
+
+**Keep `policy.py` free of `google.adk`.** If something there starts needing it, it belongs in
+`safety_plugin.py`. `classify_failure`, `_CAP_OVERRIDE` and `_KNOWN_ERROR_KINDS` stayed in
+`policy.py` deliberately — they are ADK-free and `safety_plugin.py` imports them back.
+
+## SafetyPlugin's four callbacks (`safety_plugin.py`)
 
 Three route failures; the fourth (`before_model_callback`) is not about failure at all — it is the
 context-cost hook, described in its own section below. Which failures land in which of the other
@@ -128,15 +146,61 @@ materializes a real `adhoc-<session.id>` task row when `tool_context.state` carr
 `orbit_task_id`, rather than assuming one exists. Found by running the Prompt 0 test suite, not by
 inspection. The MCP servers carry their own variants of this fallback for the same reason.
 
+## Conversations reuse their runner — and therefore their MCP servers
+
+`run_task` caches one `InMemoryRunner` per `conversation_id` (`_RUNNER_CACHE`). Turn two of a
+conversation continues turn one's actual ADK session: the same tool calls, results and browser
+session, not the text summary `_build_conversation_context` produces.
+
+Measured 2026-09-08 in a `--serve` worker: turn one 13.2s, turns two and three 4.5s and 4.9s. The
+speedup is a side effect — the six MCP servers are no longer respawned per turn — and it is the
+reason the separately-planned "make MCP servers persistent" work was never needed as its own change.
+
+**Two properties make it safe, and losing either breaks it:**
+
+1. **Tasks in one worker are strictly sequential.** `_serve` awaits each goal before reading the
+   next line. The headless lane's `Semaphore(5)` permits concurrency in principle, so a caller
+   running conversation turns concurrently would share one browser session between them — the
+   "browser is already in use" collision the eval harness found once already. Do not make this cache
+   concurrent without solving that.
+2. **Every tool call carries its true task_id.** `SafetyPlugin.before_tool_callback` injects it into
+   `tool_args`, using the `task_id: str = ""` parameter every MCP tool already declares. Without
+   that, a long-lived server would keep the `ORBIT_TASK_ID` it was spawned with and file every
+   later turn's events under the first task.
+
+**The text summary is a bridge, not a duplicate.** It is injected *only* when no cached runner
+exists — the first turn after a worker restart, where the DB remembers the conversation but the
+session is gone. When a session exists, injecting a paraphrase on top would show the model every
+turn twice.
+
+`close_conversation()` releases a conversation's runner and its subprocesses; the GUI sends
+`{"close_conversation": ...}` when the user starts a new chat, the REPL calls it on `/new`, and
+`close_all_conversations()` runs when the worker's stdin closes. A one-off task with no
+conversation_id is untouched: fresh runner, closed in `finally`, exactly as before.
+
 ## `run_task.py` gotchas
 
-- **The top-level `except Exception` reports every failure as a provider outage.** It routes
-  everything to `graceful_degradation_message()`, which says "I can't think right now — the model
-  provider call failed". A bug in a tool, a DB error, or a cancelled coroutine all surface to the
-  user as a provider problem. Narrow the catch before trusting that message.
-- `await runner.close()` in the `finally` is required, not tidiness. Each run spawns its own
-  Playwright MCP subprocess holding a Chrome profile lock; a leak collides with the next task
-  ("browser is already in use"). Found by the eval harness.
+- **The run loop is `runner.run_async`, not `run_debug`, and that is load-bearing.** `run_debug` is
+  ADK's own debug helper — its docstring says to use `run_async` in production — and it collects
+  every event into a list it returns only when the task is over. Under it a task was silent from
+  submission to completion, which is why the GUI's step rail could not fill in until there was
+  nothing left to watch. Each interesting event is now handed to `run_task`'s `on_event` sink as ADK
+  yields it; see the Progress events block at the top of the module for the event shapes and for who
+  supplies which sink. `StreamingMode.SSE` additionally splits the answer into incremental deltas —
+  it does **not** speed up the first token (measured 2.23s SSE vs 2.24s NONE, MCP connect excluded).
+- **The `result` event is emitted before the `finally`.** `runner.close()` measured 2-3s tearing down
+  six MCP subprocesses, and the user has no reason to wait through it with a locked input once the
+  answer exists. Do not "tidy" that emit into the exit path.
+- The top-level catch is narrowed by failure class: `CancelledError` → CANCELLED, connection/OS
+  errors → `graceful_degradation_message()` ("the model provider call failed"), everything else →
+  its own type name. An earlier revision routed *everything* to the provider-outage message, so a
+  tool bug and a DB error both surfaced as a provider problem; that is fixed, and the fix is worth
+  keeping — the message is only honest if the catch is specific.
+- `await runner.close()` in the `finally` is required for a task with **no conversation_id** — each
+  such run spawns its own Playwright MCP subprocess holding a Chrome profile lock, and a leak
+  collides with the next task ("browser is already in use"). Found by the eval harness. A
+  conversation's runner deliberately survives instead (see above); the same collision cannot happen
+  because the next turn reuses that exact subprocess rather than spawning a rival.
 - It sets `os.environ["ORBIT_TASK_ID"]` too, but that is belt-and-suspenders — see
   `orbit/skills/CLAUDE.md` for the mechanism that actually delivers it.
 - stdout/stderr are reconfigured to UTF-8 because the Windows console codepage renders model output
@@ -160,11 +224,17 @@ default" philosophy `risk_tiers.yaml`'s tool registry already uses, applied one 
 this; `run_task.py`'s CLI exposes it as `--foreground`, off by default so existing invocations are
 unaffected.
 
-Nemotron needs `chat_template_kwargs.enable_thinking=False` (`_MODEL_EXTRA_BODY`). Left on, it
-interleaves raw chain-of-thought into returned content — which leaked verbatim into a user-facing
-answer during testing — and spends the `max_tokens` budget on thinking instead of the reply. Tool
-calling stays clean with it off. Every model in `KNOWN_MODELS` was checked to support tool calling
-before being listed; one that does not cannot drive this agent at all.
+**Reasoning is the thing to watch when changing `DEFAULT_MODEL`.** A model that thinks before it
+speaks pays that cost on *every turn of the agent loop*, and the loop is where all the turns are.
+`gemini-3.7-flash` was the default until 2026-09-07 at roughly 3s per turn — 225 reasoning tokens
+spent on "count from 1 to 20" — and OpenRouter refuses to disable it for that endpoint at all
+(`reasoning: {max_tokens: 0}` → "Reasoning is mandatory for this endpoint"). The default is now
+`gemini-2.5-flash`. An older revision of this file documented a `_MODEL_EXTRA_BODY` carrying
+Nemotron's `chat_template_kwargs.enable_thinking=False` for the same class of problem; that constant
+no longer exists anywhere in the codebase.
+
+Every model in `KNOWN_MODELS` was checked to support tool calling before being listed; one that does
+not cannot drive this agent at all.
 
 `select_model()` fails loudly with the exact `.env` line to add when a provider's key is missing.
 Note the first LiteLLM call takes ~18s (warm-up) and subsequent ones ~1s — not a hang.
@@ -182,11 +252,11 @@ Note the first LiteLLM call takes ~18s (warm-up) and subsequent ones ~1s — not
 - `get_daily_cost` sums `events.cost_usd` for a tool_call within a day, meant to be checked *before*
   spending rather than after so a cap actually stops spend. It has **no callers anywhere in this
   codebase** — its one caller was the old voice runtime's daily transcription-cost cap, removed with
-  that code. **Voice has since been rebuilt (`gui/voice.py`) and does not restore the cap**, so
-  Deepgram streaming currently bills per minute of audio with nothing watching the total. That makes
-  this function's most obvious caller a live gap rather than a hypothetical one. Nothing about its
-  implementation is voice-specific — it caps any tool_call.
-- Event logging is duplicated across `policy.py` and `orbit/tools/foundation.py` (Fix 7 pending);
+  that code. **Voice spend is now capped elsewhere** —
+  `gui/spend.py` guards both directions (Aura characters, Nova-3 seconds) in its own file, because the
+  GUI never writes event rows. So this function still has no callers, and is still the right home
+  for a cap on a *tool's* spend.
+- Event logging is duplicated across `safety_plugin.py` and `orbit/tools/foundation.py` (Fix 7 pending);
   `tests/CLAUDE.md` has the rule that follows from it.
 
 ## `pending_confirmations` — the approval channel

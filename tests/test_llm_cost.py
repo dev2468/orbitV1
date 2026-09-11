@@ -26,7 +26,7 @@ import pytest
 from orbit import agent as agent_mod
 from orbit.mcp_servers import browser_policy_tools as bpt
 from orbit.mcp_servers import perception_server as psrv
-from orbit.policy import SafetyPlugin
+from orbit.safety_plugin import SafetyPlugin
 
 
 def _fn_response(name, response):

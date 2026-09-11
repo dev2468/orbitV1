@@ -460,7 +460,41 @@ def _region_to_monitor(region: Optional[dict], sct: "mss.base.MSSBase") -> dict:
 #   leaving it to whichever tool happened to run first.
 # ===========================================================================
 
-_VISION_MODEL = "openrouter/google/gemma-3-27b-it"
+# The vision tier's own model, separate from the coordinator's — the two are
+# chosen for different jobs and change independently.
+#
+# Measured 2026-09-08 by `benchmarks/grounding_bench.py`, four arms, identical
+# synthetic fixtures, 12 targets each:
+#
+#   arm              model              shape        hit    median miss
+#   freeform_point   gemma-3-27b-it     point        17%    122 px
+#   set_of_mark      gemma-3-27b-it     set_of_mark  58%     96 px
+#   gemini25_point   gemini-2.5-flash   point        67%     23 px
+#   gemini25_som     gemini-2.5-flash   set_of_mark  83%     34 px
+#
+# Two conclusions, and the reason this constant changed:
+#
+#   1. **The model was the binding constraint, not the prompt shape.** Holding
+#      the shape fixed and swapping the model moved point-grounding 17% -> 67%
+#      and set-of-mark 58% -> 83%, and cut the median miss from 122px to
+#      ~30px. A 122px miss on a real toolbar is several buttons away; 23px is
+#      inside most of them.
+#   2. **Set-of-mark still wins on the better model** (83% vs 67%), so the two
+#      tiers are not redundant — see `perception_find_element`'s tier order.
+#
+# gemini-2.5-flash costs ~2.0s per call against gemma's ~1.2s. That is the
+# right trade for 4x the accuracy on a tier that never auto-actuates anyway.
+#
+# CAVEAT, and it is load-bearing: these are SYNTHETIC fixtures. Per
+# `benchmarks/CLAUDE.md`, quote them as "arm X beat arm Y by N points on the
+# synthetic set", never as "Orbit's vision tier is 83% accurate". The `dense`
+# category scored 1/3 even at its best — small, tightly-packed targets remain
+# the weak spot for every arm measured.
+#
+# If you change this constant, RE-RUN THE BENCHMARK. The prompt encodes a
+# response format (`_VISION_PROMPT`), and a model that does not honour it
+# fails silently — which is exactly what happened before 2026-09-08.
+_VISION_MODEL = "openrouter/google/gemini-2.5-flash"
 
 # Inline-image ceiling. OpenRouter proxies to various providers; keeping
 # the conservative 180k-char limit avoids surprises across backends.
@@ -489,10 +523,40 @@ _VISION_BOX_RE = re.compile(
 )
 _VISION_CONF_RE = re.compile(r'"confidence"\s*:\s*(-?\d+\.?\d*)')
 
+# The prompt MUST specify the output format, and this one did not until
+# 2026-09-08. That is not a style point — it was a silent 0% failure.
+#
+# The old prompt ended "Report where it is in the image", and the model did
+# exactly that, in prose: "The EDIT menu is located in the menu bar at the top
+# of the window, between FILE and VIEW." `_parse_vision_reply` wants Gemini's
+# `{"point": [y, x]}` convention, found nothing, and every call came back as
+# `tool_failure: the vision model returned no locatable point`.
+#
+# The format was never stated because the prompt was written against a model
+# that emits normalised point JSON natively. `_VISION_MODEL` is now
+# `gemma-3-27b-it`, which does not, and the prompt did not move with it.
+#
+# Measured by `benchmarks/grounding_bench.py`: the freeform arm scored 0/12
+# with **10 of 12 replies unparseable**. The set-of-mark arm, which has always
+# stated its format, answered 12/12 on the same images. That gap was the
+# prompt, not the model.
+#
+# So: state the schema, state the coordinate convention, and give it a way to
+# say "not found" that is not prose. If you change `_VISION_MODEL`, re-run the
+# benchmark — a format a new model does not honour fails exactly this quietly.
 _VISION_PROMPT = (
-    "This is a screenshot of an application window.\n"
-    "Locate this UI element: {description}\n"
-    "Report where it is in the image."
+    "You are looking at a screenshot of an application window.\n\n"
+    "Find this UI element: {description}\n\n"
+    "Reply with ONLY a JSON object and no other text, no explanation and no "
+    "code fence:\n"
+    '{{"point": [y, x], "confidence": 0.0}}\n\n'
+    "where:\n"
+    "- y and x are integers from 0 to 1000, normalised to the image "
+    "(y measured from the TOP edge, x from the LEFT edge)\n"
+    "- the point is the CENTRE of the element\n"
+    "- confidence is between 0.0 and 1.0\n\n"
+    'If the element is not visible, reply exactly {{"point": null, '
+    '"confidence": 0.0}}'
 )
 
 # SET-OF-MARK — the second representation, added after the spike

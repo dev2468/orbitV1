@@ -53,7 +53,8 @@ from orbit.mcp_servers.browser_policy_tools import (
     open_session_tool,
 )
 from orbit.mcp_servers.memory_tools import get_policy_tool, write_memory_tool
-from orbit.policy import SafetyPlugin, load_tool_registry
+from orbit.policy import load_tool_registry
+from orbit.safety_plugin import SafetyPlugin
 from orbit.run_task import run_task
 from orbit.skills import memory as memory_skill
 from orbit.skills import research_product

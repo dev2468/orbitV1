@@ -13,11 +13,17 @@ pywin32
 # module docstring for the OCR/vision-tier libraries deliberately NOT added.
 mss
 PySide6
-# Voice input: Deepgram Nova-3 streaming STT over WebSocket (gui/voice.py).
-# Input only — there is no TTS in this build and no Aura/Kokoro dependency.
-# sounddevice captures the mic; numpy computes the RMS that drives the orb.
+# Voice, both directions, on one key: Deepgram Nova-3 streaming STT over
+# WebSocket (gui/voice.py) and Deepgram Aura TTS (gui/speech.py). The `speak`
+# client ships in the same SDK, so speech output added no new dependency.
+# sounddevice does mic capture AND playback; numpy computes the RMS that
+# drives the orb.
 deepgram-sdk
 sounddevice
 numpy
+# httpx is a litellm dependency, listed explicitly because orbit/ack.py uses it
+# directly and on purpose: the acknowledgement track runs in the GUI process,
+# where `import litellm` costs 8.7s that a one-second reply cannot afford.
+httpx
 pytest
 pytest-asyncio

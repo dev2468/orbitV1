@@ -305,7 +305,7 @@ vision code in `perception_tools.py` — next to the code, not in a separate doc
 
 The short version of what the spike decided: the tool makes its **own** LiteLLM call to a multimodal
 model rather than going through the orchestrating agent's model, which is not multimodal. The model
-is `_VISION_MODEL` in `perception_tools.py` — today `openrouter/google/gemma-3-27b-it`. (The spike
+is `_VISION_MODEL` in `perception_tools.py` — today `openrouter/google/gemini-2.5-flash`, chosen on the 2026-09-08 benchmark (see the comment above the constant). (The spike
 itself ran against `nvidia_nim/google/gemma-4-31b-it`; the whole project has since moved to
 OpenRouter, so that name survives only inside the historical VISION TIER comment block.) Asked with
 no output format imposed, Gemma answers in its native pointing format — `{"point": [y, x]}`

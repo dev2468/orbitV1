@@ -440,21 +440,16 @@ async def session_reaper_loop() -> None:
             pass
 
 
-async def close_sessions_for_task(task_id: str) -> list[str]:
-    """Close every session opened under a task. Callable internally; not
-    exposed to the model."""
-    closed = []
-    for session_id in list(SESSIONS):
-        sess = SESSIONS.get(session_id)
-        if sess is not None and sess.task_id == task_id:
-            SESSIONS.pop(session_id, None)
-            await _shutdown_session(sess)
-            closed.append(session_id)
-    return closed
-
-
 async def aclose_all_sessions() -> None:
-    """Safety net for shutdown and tests. MUST be awaited on the same event
+    """Safety net for shutdown and tests.
+
+    This is the ONLY session-closing path, and it is enough: this server is
+    spawned per task and torn down with it (run_task's `runner.close()`), so
+    process lifetime already bounds session lifetime. A
+    `close_sessions_for_task()` used to sit above this, callable but never
+    called, describing a per-task cleanup that the process boundary was
+    already doing. Deleted 2026-09-08.
+ MUST be awaited on the same event
     loop the sessions were created on — calling it via a fresh
     asyncio.run() from a different loop is what the old __main__ block did,
     and it could never have worked. The server now runs it from a FastMCP

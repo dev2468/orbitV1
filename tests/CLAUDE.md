@@ -1,6 +1,6 @@
 # tests/ — philosophy, fixtures, and the real-DB trap
 
-**354 tests across 21 test files** (`pytest tests/ -q` collects them all; one file,
+**552 tests across 26 test files** (`pytest tests/ -q` collects them all; one file,
 `test_windows_control_live.py`, skips itself unless opted in).
 
 Grouped by what they are for:
